@@ -118,10 +118,10 @@
       .header .compact-btn { padding: 2px 6px; font-size: 10px; flex-shrink: 0; }
       .prompt-timeline { right: 8px; }
       .prompt-timeline .timeline-inner { gap: 0; padding: 8px 0; }
-      .prompt-timeline .line-item { width: 18px; height: 10px; /* 2px可见条 + 上下各4px透明交互区 */ }
-      .prompt-timeline .line-item::before { content: ''; position: absolute; right: 0; top: 4px; width: 18px; height: 2px; background: var(--ac); border-radius: 999px; transition: height .15s, width .15s; }
-      .prompt-timeline .line-item:hover::before { height: 4px; width: 24px; }
-      .prompt-timeline .line-item .tip { font-size: 12px; padding: 4px 10px; max-width: 50vw; min-width: 220px; white-space: normal; word-break: break-word; line-height: 1.4; overflow: visible; }
+      .prompt-timeline .line-item { width: 18px; height: 8px; /* 3px可见条 + 上下各2.5px透明交互区 */ }
+      .prompt-timeline .line-item::before { content: ''; position: absolute; right: 0; top: 2.5px; width: 18px; height: 3px; background: var(--ac); border-radius: 999px; transition: height .15s, width .15s; }
+      .prompt-timeline .line-item:hover::before { height: 5px; width: 24px; }
+      .prompt-timeline .line-item .tip { font-size: 12px; padding: 4px 10px; max-width: 50vw; min-width: 220px; white-space: normal; word-break: break-word; line-height: 1.4; overflow: visible; background: var(--bk3); }
     }
     @media (max-width: 640px) {
       .provider-panel { padding: 12px; }
@@ -276,10 +276,10 @@
     .cursor { display: inline-block; width: 7px; height: 16px; background: var(--ac); animation: blink .7s infinite; vertical-align: text-bottom; margin-left: 2px; }
     .prompt-timeline { position: fixed; right: 24px; top: 50%; transform: translateY(-50%); width: auto; pointer-events: none; z-index: 100; }
     .prompt-timeline .timeline-inner { position: relative; width: 100%; display: flex; flex-direction: column; align-items: flex-end; gap: 0; padding: 12px 0; }
-    .prompt-timeline .line-item { position: relative; width: clamp(24px, 5vw, 50px); height: 10px; /* 2px可见条 + 上下各4px透明交互区 */ cursor: pointer; pointer-events: auto; transition: background .15s; opacity: 1; }
-    .prompt-timeline .line-item::before { content: ''; position: absolute; right: 0; top: 4px; width: clamp(24px, 5vw, 50px); height: 2px; background: var(--ac); border-radius: 999px; box-shadow: 0 0 3px rgba(88,166,255,0.5); transition: height .15s, width .15s, box-shadow .15s; }
-    .prompt-timeline .line-item:hover::before { height: 4px; width: clamp(30px, 6.5vw, 60px); box-shadow: 0 0 8px rgba(88,166,255,0.8); }
-    .prompt-timeline .line-item .tip { position: absolute; right: calc(100% + 16px); top: 50%; transform: translateY(-50%); font-size: 14px; font-weight: 500; color: var(--fc); background: var(--bk2); padding: 6px 12px; border-radius: 6px; border: 1px solid var(--bd); opacity: 0; pointer-events: none; transition: opacity .15s; z-index: 200; box-shadow: 0 2px 8px rgba(0,0,0,0.3); max-width: 60vw; min-width: 280px; white-space: normal; word-break: break-word; line-height: 1.5; overflow: visible; }
+    .prompt-timeline .line-item { position: relative; width: clamp(24px, 5vw, 50px); height: 8px; /* 3px可见条 + 上下各2.5px透明交互区 */ cursor: pointer; pointer-events: auto; transition: background .15s; opacity: 1; }
+    .prompt-timeline .line-item::before { content: ''; position: absolute; right: 0; top: 2.5px; width: clamp(24px, 5vw, 50px); height: 3px; background: var(--ac); border-radius: 999px; box-shadow: 0 0 3px rgba(88,166,255,0.5); transition: height .15s, width .15s, box-shadow .15s; }
+    .prompt-timeline .line-item:hover::before { height: 5px; width: clamp(30px, 6.5vw, 60px); box-shadow: 0 0 8px rgba(88,166,255,0.8); }
+    .prompt-timeline .line-item .tip { position: absolute; right: calc(100% + 16px); top: 50%; transform: translateY(-50%); font-size: 14px; font-weight: 500; color: var(--fc); background: var(--bk3); padding: 6px 12px; border-radius: 6px; border: 1px solid var(--bd); opacity: 0; pointer-events: none; transition: opacity .15s; z-index: 200; box-shadow: 0 2px 8px rgba(0,0,0,0.3); max-width: 60vw; min-width: 280px; white-space: normal; word-break: break-word; line-height: 1.5; overflow: visible; }
     .prompt-timeline .line-item:hover .tip { opacity: 1; }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
     .reasoning { margin-bottom: 8px; }
@@ -3676,10 +3676,18 @@ const redirCmd = (cmd) => { return cmd + ' 2>' + DEVNULL }
 const killTree = (child) => {
   if (!child || !child.pid) return
   try {
-    if (IS_WIN) execAsync('taskkill /PID ' + child.pid + ' /T /F', 5000).catch(() => {})
-    else {
-      try { process.kill(-child.pid, 'SIGTERM') } catch(e) {}
-      setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL') } catch(e) {} }, 1500)
+    if (IS_WIN) {
+      execAsync('taskkill /PID ' + child.pid + ' /T /F', 5000).catch(() => {})
+    } else {
+      // Kill entire process tree: first try process group, then recursively kill children
+      const pid = child.pid
+      try { process.kill(-pid, 'SIGTERM') } catch(e) {}
+      // Also kill all descendants using pkill -P (parent PID)
+      execAsync('pkill -P ' + pid, 3000).catch(() => {})
+      setTimeout(() => {
+        try { process.kill(-pid, 'SIGKILL') } catch(e) {}
+        execAsync('pkill -9 -P ' + pid, 3000).catch(() => {})
+      }, 1500)
     }
   } catch(e) {}
 }
@@ -4024,6 +4032,14 @@ const writeFileJson = (full, obj) => {
   try { fs.chmodSync(full, 0o600) } catch(e) {}
 }
 
+// Helper to read settings with default deletedProviders array
+const getDeletedProviders = (st) => {
+  if (!st) st = {}
+  if (!Array.isArray(st.deletedProviders)) st.deletedProviders = []
+  st.deletedProviders = st.deletedProviders.filter(x => typeof x === 'string')
+  return st.deletedProviders
+}
+
 const PROVIDER_PRESETS = [
   { name: 'openai', api: 'openai-completions', baseUrl: 'https://api.openai.com/v1', models: [
     { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true, contextWindow: 1050000, maxTokens: 181888 },
@@ -4087,8 +4103,10 @@ $fend('providers', (data) => {
     else if (pm.provider === 'oc' && (mj.providers || {}).omniroute) eff = 'omniroute'
   }
   const hidden = ((st.hiddenProviders) || []).filter((x) => typeof x === 'string')
+  const deleted = getDeletedProviders(st)
   const list = []
   for (const p of PROVIDER_PRESETS) {
+    if (deleted.indexOf(p.name) >= 0) continue
     const isHidden = hidden.indexOf(p.name) >= 0
     const existing = (mj.providers || {})[p.name] || {}
     const hasKey = !!(existing.apiKey && String(existing.apiKey) !== '' && !/^\$/.test(String(existing.apiKey)))
@@ -4158,14 +4176,17 @@ $fend('provider_save', (data) => {
       })
     } else {
       const preset = PROVIDER_PRESETS.find((p) => p.name === name)
-      if (!preset) return { ok: false, error: 'unknown provider: ' + name }
       const apiKey = data && data.apiKey ? String(data.apiKey).trim() : ''
       if (!apiKey) {
-        const old = (mj.providers[name] || {}).apiKey
+        const existing = (mj.providers[name] || {})
+        const old = existing.apiKey
         if (!old) return { ok: false, error: 'API key required for ' + name }
       }
-      const prev = mj.providers[name] || {}
-      mj.providers[name] = { baseUrl: preset.baseUrl, api: preset.api, apiKey: apiKey || prev.apiKey || null, authHeader: true, models: preset.models }
+      const existing = mj.providers[name] || {}
+      const baseUrl = preset ? preset.baseUrl : (existing.baseUrl || '')
+      const api = preset ? preset.api : (existing.api || 'openai-completions')
+      const models = preset ? preset.models : (existing.models || [])
+      mj.providers[name] = { baseUrl: baseUrl, api: api, apiKey: apiKey || existing.apiKey || null, authHeader: true, models: models }
       if (!mj.providers[name].apiKey) delete mj.providers[name].apiKey
       st.defaultProvider = name
       st.defaultModel = preset.models[0] ? name + '/' + preset.models[0].id : undefined
@@ -4289,12 +4310,13 @@ $fend('provider_delete', (data) => {
   try {
     const mj = readModelsJson() || { providers: {} }
     if (!mj.providers) mj.providers = {}
-    const isPreset = !!PROVIDER_PRESETS.find((p) => p.name === name)
     const st = readSettingsJson()
     if (!st.hiddenProviders) st.hiddenProviders = []
+    const deleted = getDeletedProviders(st)
+    const isPreset = !!PROVIDER_PRESETS.find((p) => p.name === name)
     if (isPreset) {
-      // presets live in PROVIDER_PRESETS, not models.json; hide via settings so they don't reappear
-      if (st.hiddenProviders.indexOf(name) < 0) st.hiddenProviders.push(name)
+      if (deleted.indexOf(name) < 0) deleted.push(name)
+      st.deletedProviders = deleted
     } else {
       if (!mj.providers[name]) return { ok: false, error: 'provider not found: ' + name }
       delete mj.providers[name]
