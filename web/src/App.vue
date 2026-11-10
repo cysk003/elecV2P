@@ -312,13 +312,14 @@ export default {
         x: touch ? touch.clientX : event.clientX,
         y: touch ? touch.clientY : event.clientY
       }
-      const btnRect = this.$el.querySelector('.pi-efh-btn').getBoundingClientRect()
-      const rootRect = this.$el.getBoundingClientRect()
+      const btn = this.$el.querySelector('.pi-efh-btn')
+      // 拖动期间禁用 hover 缩放，保证 getBoundingClientRect 测量的是未缩放的真实位置
+      btn.classList.add('pi-efh-btn--dragging')
+      const btnRect = btn.getBoundingClientRect()
+      // 按钮为 position: fixed，偏移需以视口而非 app-root 元素为基准，否则页面可滚动/移动端 100vh 误差会导致首次拖动瞬移
       this.piEfhPosition = {
-        right: Math.round(rootRect.width - btnRect.right),
-        bottom: Math.round(rootRect.height - btnRect.bottom),
-        width: btnRect.width,
-        height: btnRect.height
+        right: document.documentElement.clientWidth - btnRect.right,
+        bottom: document.documentElement.clientHeight - btnRect.bottom
       }
       document.addEventListener('mousemove', this.dragMove)
       document.addEventListener('mouseup', this.dragEnd)
@@ -337,12 +338,9 @@ export default {
       // 只有真正拖动时才 preventDefault，避免阻止 click
       event.preventDefault()
       const root = this.$el
-      const rootRect = root.getBoundingClientRect()
       const btnRect = this.piEfhPosition
       const newRight = Math.max(20, btnRect.right - dx)
       const newBottom = Math.max(20, btnRect.bottom - dy)
-      root.style.setProperty('--pi-efh-left', 'auto')
-      root.style.setProperty('--pi-efh-top', 'auto')
       root.style.setProperty('--pi-efh-right', newRight + 'px')
       root.style.setProperty('--pi-efh-bottom', newBottom + 'px')
     },
@@ -354,18 +352,20 @@ export default {
       document.removeEventListener('touchmove', this.dragMove)
       document.removeEventListener('touchend', this.dragEnd)
       if (this.piEfhPosition) {
-        const btnRect = this.$el.querySelector('.pi-efh-btn').getBoundingClientRect()
-        const rootW = this.$el.getBoundingClientRect().width
-        const rootH = this.$el.getBoundingClientRect().height
+        const btn = this.$el.querySelector('.pi-efh-btn')
+        const btnRect = btn.getBoundingClientRect()
         try {
           localStorage.setItem('piEfhPosition', JSON.stringify({
-            right: Math.round(rootW - btnRect.right),
-            bottom: Math.round(rootH - btnRect.bottom)
+            right: Math.round(document.documentElement.clientWidth - btnRect.right),
+            bottom: Math.round(document.documentElement.clientHeight - btnRect.bottom)
           }))
         } catch(e) {}
+        btn.classList.remove('pi-efh-btn--dragging')
       }
       this.piEfhPosition = null
       this.piEfhMouseStart = null
+      // 拖动结束后的那次 click 依赖 piEfhJustDragged 来抑制打开窗口，延时清除以免误吞下一次正常点击
+      setTimeout(() => { this.piEfhJustDragged = false }, 150)
     },
     restorePiEfhPosition(){
       let stored = null
@@ -375,8 +375,6 @@ export default {
       } catch(e) {}
       const root = this.$el
       if (stored && stored.right !== undefined && stored.bottom !== undefined) {
-        root.style.setProperty('--pi-efh-left', 'auto')
-        root.style.setProperty('--pi-efh-top', 'auto')
         root.style.setProperty('--pi-efh-right', stored.right + 'px')
         root.style.setProperty('--pi-efh-bottom', stored.bottom + 'px')
       }
@@ -579,6 +577,7 @@ export default {
   transition: opacity .2s, transform .2s;
   z-index: 10;
   user-select: none;
+  touch-action: none;
   -webkit-app-region: no-drag;
 }
 
@@ -590,5 +589,11 @@ export default {
 .pi-efh-btn:hover {
   opacity: 1;
   transform: scale(1.05);
+}
+
+/* 双类选择器与 :hover 同优先级，写在后面靠源码顺序覆盖，避免使用 !important */
+.pi-efh-btn.pi-efh-btn--dragging {
+  transform: none;
+  transition: none;
 }
 </style>

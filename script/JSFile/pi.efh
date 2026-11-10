@@ -890,7 +890,7 @@
           <div class="d-title">auto</div><div class="d-sub">default model</div>
         </div>
         <div class="d-filter">
-          <input type="text" ref="modelFilterInput" v-model="modelFilter" placeholder="Filter models..." @click.stop @input="modelFilter = $event.target.value; modelNavIdx = 0" @keydown.up.prevent="modelNav(-1)" @keydown.down.prevent="modelNav(1)" @keydown.enter.prevent="modelNavSelect()" @keydown.esc.prevent="dropdown = ''; modelNavIdx = 0; $nextTick(() => { $refs.inputEl?.focus() })" spellcheck="false" style="width:100%;padding:6px 10px;border:1px solid var(--bd);border-radius:6px;background:transparent;color:var(--fc);font-size:16px;outline:none;box-sizing:border-box;">
+          <input type="text" ref="modelFilterInput" v-model="modelFilter" placeholder="Filter models..." @click.stop @input="modelFilter = $event.target.value; modelNavIdx = 0" @keydown.up.prevent="modelNav(-1)" @keydown.down.prevent="modelNav(1)" @keydown.enter.prevent="modelNavSelect()" @keydown.esc.prevent="dropdown = ''; modelNavIdx = 0; modelFilter = ''; $nextTick(() => { $refs.inputEl?.focus() })" spellcheck="false" style="width:100%;padding:6px 10px;border:1px solid var(--bd);border-radius:6px;background:transparent;color:var(--fc);font-size:16px;outline:none;box-sizing:border-box;">
         </div>
         <div class="d-list">
           <div v-for="(m, mi) in filteredModels" :key="m" :class="['d-item', {active: m===currentModel, nav: mi===modelNavIdx}]" @click="selectModel(m)" @mouseenter="modelNavIdx = mi">
@@ -1429,6 +1429,7 @@
         if (m !== undefined) { 
           this.selectModel(m); 
           this.dropdown = ''
+          this.modelFilter = ''
           this.$nextTick(() => { this.$refs.inputEl?.focus() })
         }
       },
@@ -1453,7 +1454,8 @@
             this.scrollToCurrentModel()
           })
         } else if (wasOpen) {
-          // 如果关闭了下拉菜单，返回焦点到输入框
+          // 如果关闭了下拉菜单，清除模型筛选，返回焦点到输入框
+          this.modelFilter = ''
           this.$nextTick(() => { this.$refs.inputEl?.focus() })
         }
       },
@@ -1721,6 +1723,7 @@
         const pidx = model.indexOf('/')
         if (pidx > 0 && model.slice(0, pidx) === 'omniroute' && !this.omniRunning) {
           this.dropdown = ''
+          this.modelFilter = ''
           if (!confirm('OmniRoute is not started yet.\nEnable and start it now?')) return
           this.omniPendingModel = model
           this.useOmniRoute()
@@ -1729,6 +1732,7 @@
         this.currentModel = model
         localStorage.setItem('aichat_pi_last_model', this.currentModel)
         this.dropdown = ''
+        this.modelFilter = ''
         this.$nextTick(() => { this.$refs.inputEl?.focus() })
         this.refreshCtx()
         this.loadProviders().catch(() => {})
@@ -1744,6 +1748,7 @@
         this.currentModel = (m || '').replace(/\r/g, '')
         localStorage.setItem('aichat_pi_last_model', this.currentModel)
         this.dropdown = ''
+        this.modelFilter = ''
         this.$nextTick(() => { this.$refs.inputEl?.focus() })
         this.refreshCtx()
         this.loadProviders().catch(() => {})
@@ -2643,6 +2648,7 @@
         if (this.dropdown === 'model' && e.key === 'Escape') {
           e.preventDefault()
           this.dropdown = ''
+          this.modelFilter = ''
           this.modelNavIdx = 0
           this.$nextTick(() => { this.$refs.inputEl?.focus() })
           return
@@ -3601,6 +3607,7 @@
         const dropdownEl = document.getElementById('modelDropdown')
         if (dropdownEl && !dropdownEl.contains(e.target) && self.dropdown === 'model') {
           self.dropdown = ''
+          self.modelFilter = ''
           self.$nextTick(() => { self.$refs.inputEl?.focus() })
         } else {
           self.dropdown = ''
