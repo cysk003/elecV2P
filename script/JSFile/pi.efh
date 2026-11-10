@@ -2933,6 +2933,11 @@
               }
               return
             }
+            if (data.type === 'stop') {
+              // run 被外部停止（或 watchdog/重试耗尽）：清掉所有 running/retrying 动画标记，让 UI 一致地收尾
+              clearRunning()
+              return
+            }
             if (data.type === 'init') {
               if (data.content && el.initShown !== data.content) {
                 flushText()
@@ -3043,6 +3048,7 @@
               return
             }
             if (data.type === 'done') {
+              clearRunning()
               flushText()
               if (data.content) el.parts.push({ t: 'text', c: data.content })
               el.streaming = false
@@ -3082,6 +3088,7 @@
               return
             }
             if (data.type === 'error') {
+              clearRunning()
               flushText()
               el.streaming = false
               el.errored = true
@@ -4740,6 +4747,8 @@ $fend('commands', () => {
 })
 
 const runProcs = {}
+// runId -> { aliveTimer, toolHeartbeat, watchdog }：模块级 registry，让 $fend('stop') 能清除 run 级定时器
+const runTimers = {}
 
 $fend('start', (data) => {
   if (!data || !data.prompt) return { error: 'prompt is required' }
@@ -4825,6 +4834,8 @@ $fend('start', (data) => {
   const kickWatchdog = () => {
     if (watchdog) clearTimeout(watchdog)
     watchdog = setTimeout(() => { finish({ timeout: true }) }, 600000)
+    runTimers[runId] = runTimers[runId] || {}
+    runTimers[runId].watchdog = watchdog
   }
 
   const send = (type, payload) => {
@@ -4883,6 +4894,8 @@ $fend('start', (data) => {
     if (watchdog) clearTimeout(watchdog)
     if (aliveTimer) clearInterval(aliveTimer)
     if (toolHeartbeat) clearInterval(toolHeartbeat)
+    watchdog = null; aliveTimer = null; toolHeartbeat = null
+    if (runTimers[runId]) { runTimers[runId].watchdog = null; runTimers[runId].aliveTimer = null; runTimers[runId].toolHeartbeat = null }
     try { delete runProcs[runId] } catch(e) {} try { $cache.delete('pi_run_' + runId) } catch(e) {}
     try { $cache.delete('pi_stop_' + runId) } catch(e) {}
     // watchdog 超时结束时 pi 可能仍在运行，需要杀掉，否则会继续写 session
@@ -4895,6 +4908,8 @@ $fend('start', (data) => {
     if (watchdog) clearTimeout(watchdog)
     if (aliveTimer) clearInterval(aliveTimer)
     if (toolHeartbeat) clearInterval(toolHeartbeat)
+    watchdog = null; aliveTimer = null; toolHeartbeat = null
+    if (runTimers[runId]) { runTimers[runId].watchdog = null; runTimers[runId].aliveTimer = null; runTimers[runId].toolHeartbeat = null }
     try { delete runProcs[runId] } catch(e) {} try { $cache.delete('pi_run_' + runId) } catch(e) {}
     try { $cache.delete('pi_stop_' + runId) } catch(e) {}
     killTree(proc)
@@ -5257,7 +5272,13 @@ $fend('start', (data) => {
   }
   // unified end-of-run: recover (switch model) when the run died with error signs but produced no output
   const endRun = (code, via) => {
-    if (streamEnded || retrying || pronBreaking || isStopped()) return
+    if (streamEnded || retrying || pronBreaking || isStopped()) {
+      // stopped externally: ensure front-end clears running/retrying animation
+      if (isStopped()) {
+        try { $ws.sse(APP_CH, JSON.stringify({ type: 'stop', runId })) } catch(e) {}
+      }
+      return
+    }
     const errHint = autoRetryCount > 0 || !!lastErrText || /error|fail|unavailable|overload|refused|timeout|econn|exceed/i.test(stderrTail)
     if (!errHint) {
       if (code !== 0) fail('pi exited with code ' + code)
@@ -5380,6 +5401,9 @@ $fend('start', (data) => {
         if (rt.lastOutput) emitOut(id, maskSecrets(rt.lastOutput), (d) => { send('out', { content: d }) })
       }
     }, 15000)
+    runTimers[runId] = runTimers[runId] || {}
+    runTimers[runId].aliveTimer = aliveTimer
+    runTimers[runId].toolHeartbeat = toolHeartbeat
     return proc
   }
 
@@ -5392,6 +5416,7 @@ $fend('start', (data) => {
     try { delete runProcs[runId] } catch(e) {} try { $cache.delete('pi_run_' + runId) } catch(e) {}
     if (aliveTimer) { clearInterval(aliveTimer); aliveTimer = null }
     if (toolHeartbeat) { clearInterval(toolHeartbeat); toolHeartbeat = null }
+    if (runTimers[runId]) { runTimers[runId].aliveTimer = null; runTimers[runId].toolHeartbeat = null }
     setTimeout(() => {
       pronBreaking = false
       if (streamEnded || isStopped()) return
@@ -5410,6 +5435,19 @@ $fend('stop', async (data) => {
   if (!data) return { ok: false }
   const rp = runProcs[data.runId] || $cache.get('pi_run_' + data.runId) || $cache.get('pi_compact_' + data.runId)
   if (rp) {
+    // 1) 先通过模块级 registry 清掉 run 级定时器（toolHeartbeat/aliveTimer/watchdog）
+    const tm = runTimers[data.runId]
+    if (tm) {
+      try {
+        if (tm.aliveTimer) { clearInterval(tm.aliveTimer); tm.aliveTimer = null }
+        if (tm.toolHeartbeat) { clearInterval(tm.toolHeartbeat); tm.toolHeartbeat = null }
+        if (tm.watchdog) { clearTimeout(tm.watchdog); tm.watchdog = null }
+      } catch(e) {}
+    }
+    // 2) 通知前端清掉 running/retrying 动画标记（前端收到后会立即调用 clearRunning）
+    try {
+      $ws.sse(APP_CH, JSON.stringify({ type: 'stop', runId: data.runId }))
+    } catch(e) {}
     killTree(rp)
     try { delete runProcs[data.runId] } catch(e) {}
     try { $cache.delete('pi_run_' + data.runId) } catch(e) {}
