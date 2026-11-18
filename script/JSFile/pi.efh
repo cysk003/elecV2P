@@ -3379,45 +3379,44 @@
             }
             if (data.type === 'compaction_end') {
               const r = data.result || {}
-              const parts = []
-              parts.push('↻ Compaction complete')
+              const statLines = []
               if (r.tokensBefore !== undefined || r.estimatedTokensAfter !== undefined) {
-                parts.push('📊 Tokens')
+                statLines.push('📊 Tokens')
                 const before = r.tokensBefore ?? r.tokens_before ?? 0
                 const after = r.estimatedTokensAfter ?? r.estimated_tokens_after ?? 0
                 const fmt = n => Number(n).toLocaleString()
-                parts.push(`  Before: ${fmt(before)}`)
-                parts.push(`  After:  ${fmt(after)}`)
+                statLines.push(`  Before: ${fmt(before)}`)
+                statLines.push(`  After:  ${fmt(after)}`)
                 if (before && after) {
                   const reduced = before - after
                   const pct = Math.max(0, Math.round((reduced / before) * 1000) / 10)
-                  parts.push(`  Reduced: ${fmt(reduced)}  ↓ ${pct}%`)
+                  statLines.push(`  Reduced: ${fmt(reduced)}  ↓ ${pct}%`)
                 }
               }
               if (r.usage) {
-                parts.push('💰 Usage')
+                statLines.push('💰 Usage')
                 const u = r.usage
                 const fmt = n => (n ?? 0).toLocaleString()
-                if (u.input !== undefined) parts.push(`  Input: ${fmt(u.input)}`)
-                if (u.output !== undefined) parts.push(`  Output: ${fmt(u.output)}`)
-                if (u.totalTokens !== undefined) parts.push(`  Total: ${fmt(u.totalTokens)}`)
-                if (u.cacheRead !== undefined) parts.push(`  Cache read: ${fmt(u.cacheRead)}`)
-                if (u.cacheWrite !== undefined) parts.push(`  Cache write: ${fmt(u.cacheWrite)}`)
-                if (u.reasoning !== undefined) parts.push(`  Reasoning: ${fmt(u.reasoning)}`)
+                if (u.input !== undefined) statLines.push(`  Input: ${fmt(u.input)}`)
+                if (u.output !== undefined) statLines.push(`  Output: ${fmt(u.output)}`)
+                if (u.totalTokens !== undefined) statLines.push(`  Total: ${fmt(u.totalTokens)}`)
+                if (u.cacheRead !== undefined) statLines.push(`  Cache read: ${fmt(u.cacheRead)}`)
+                if (u.cacheWrite !== undefined) statLines.push(`  Cache write: ${fmt(u.cacheWrite)}`)
+                if (u.reasoning !== undefined) statLines.push(`  Reasoning: ${fmt(u.reasoning)}`)
                 const cost = u.cost
                 if (cost && typeof cost === 'object') {
                   const total = cost.total ?? cost.totalFromProvider ?? 0
-                  if (total) parts.push(`  Cost: $${Number(total).toFixed(4)}`)
+                  if (total) statLines.push(`  Cost: $${Number(total).toFixed(4)}`)
                 }
               }
-              if (r.summary) {
-                parts.push('📌 Summary')
-                parts.push('  ' + String(r.summary).slice(0, 800))
-              }
-              const msg = '<pre style="white-space:pre-wrap">' + parts.join('\n') + '</pre>'
+              // 摘要按 markdown 单独渲染（完整内容，不再截断到 800 字）；
+              // 统计信息走 out 块（转义 + 等宽），避免整段包进 <pre> 后被空行拆块。
+              const msgParts = [{ t: 'ref', c: '↻ Compaction complete', cls: 'info' }]
+              if (statLines.length) msgParts.push({ t: 'out', c: statLines.join('\n') })
+              if (r.summary) msgParts.push({ t: 'text', c: '📌 Summary\n\n' + String(r.summary) })
               self.messages.push({
                 role: 'assistant',
-                parts: [{ t: 'text', c: msg }],
+                parts: msgParts,
                 streaming: false
               })
               self.scrollBottom()
@@ -4680,8 +4679,12 @@ const convFromFile = (full) => {
     let e
     try { e = JSON.parse(ln) } catch(err) { continue }
     if (e.type === 'session') continue
-    if (e.type === 'message' && e.message) { entries.push(e); leaf = e }
-    else if (e.type === 'compaction') entries.push(e)
+    if (!e.id) continue
+    // 收集所有带 id 的条目（不只 message/compaction）。
+    // context_edit、branch_summary、label 等也会出现在 parentId 链上，
+    // 只收集 message 会让链在它们处断开，导致重开后只剩最近一段消息。
+    entries.push(e)
+    leaf = e
   }
   if (!entries.length) return []
   const byId = {}
@@ -4716,10 +4719,27 @@ const convFromFile = (full) => {
     curErrored = false
   }
   for (const e of chain) {
-    if (e.type === 'compaction') continue
-    const msg = e.message || {}
+    if (e.type === 'compaction') {
+      finalize()
+      const parts = [{ t: 'ref', c: '↻ Compaction', cls: 'info' }]
+      const stat = []
+      if (e.tokensBefore) stat.push('Tokens before: ' + Number(e.tokensBefore).toLocaleString())
+      const u = e.usage || {}
+      if (u.totalTokens) stat.push('Summary tokens: ' + Number(u.totalTokens).toLocaleString())
+      const cost = u.cost && typeof u.cost === 'object' ? (u.cost.total || u.cost.totalFromProvider || 0) : 0
+      if (cost) stat.push('Cost: $' + Number(cost).toFixed(4))
+      if (stat.length) parts.push({ t: 'out', c: stat.join('\n') })
+      if (e.summary) parts.push({ t: 'text', c: '📌 Summary\n\n' + String(e.summary) })
+      out.push({ role: 'assistant', parts: parts, streaming: false })
+      continue
+    }
+    if (e.type !== 'message' || !e.message) continue
+    const msg = e.message
     const role = msg.role || 'assistant'
-    const parts = msg.content || []
+    if (role === 'system') continue
+    // 兼容旧版本/手写 session：content 可能是字符串而不是 parts 数组
+    const raw = msg.content
+    const parts = Array.isArray(raw) ? raw : (typeof raw === 'string' ? [{ type: 'text', text: raw }] : [])
     if (role === 'user') {
       finalize()
       let text = ''
