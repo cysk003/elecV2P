@@ -260,6 +260,13 @@
       background: var(--ac); margin-left: 8px; vertical-align: middle;
       animation: pulse 1s infinite;
     }
+    .msg .ref .run-stop {
+      margin-left: 10px; padding: 0 8px; font-size: 11px; line-height: 18px;
+      border: 1px solid #f85149; border-radius: 4px; background: rgba(248,81,73,.12);
+      color: #ff7b72; cursor: pointer; font-family: inherit; vertical-align: middle;
+    }
+    .msg .ref .run-stop:hover { background: rgba(248,81,73,.26); }
+    .msg .ref .run-stop:disabled { opacity: .55; cursor: default; }
     .msg .ref.tool.generating { animation: toolGen 1.4s ease-in-out infinite; border-left-width: 4px; }
     @keyframes toolGen {
       0%, 100% { color: var(--fc2); border-left-color: #58a6ff; background: rgba(88,166,255,.08); }
@@ -932,7 +939,7 @@
       <template v-if="m.role === 'user'"><pre style="margin:0;font-family:inherit;font-size:inherit;line-height:1.7;white-space:pre-wrap;word-break:break-word;background:none;border:none;padding:0;color:inherit;">{{ m.content }}</pre></template>
       <template v-else>
         <div v-for="(p, pi) in m.parts" :key="pi">
-          <div v-if="p.t === 'ref'" :class="['ref', p.cls || refClass(p.c), p.running ? 'generating' : '']" :style="p.cls === 'reasoning' && p.body ? 'cursor: pointer;' : ''" @click="p.cls === 'reasoning' && p.body ? (p.open = p.open === undefined ? false : !p.open) : null">{{ p.c }}<span v-if="p.running" class="run-dot"></span></div>
+          <div v-if="p.t === 'ref'" :class="['ref', p.cls || refClass(p.c), p.running ? 'generating' : '']" :style="p.cls === 'reasoning' && p.body ? 'cursor: pointer;' : ''" @click="p.cls === 'reasoning' && p.body ? (p.open = p.open === undefined ? false : !p.open) : null">{{ p.c }}<button v-if="p.stopping" class="run-stop" disabled>Stopping…</button><button v-else-if="p.stop" class="run-stop" @click.stop="stopTool(p)" title="只停止这条命令，随后继续运行">Stop</button><span v-if="p.running" class="run-dot"></span></div>
           <div v-if="p.t === 'ref' && p.cls === 'reasoning' && p.body && p.open !== false" class="reasoning-body" @scroll="reasoningScroll($event)">{{ p.body }}</div>
           <pre v-else-if="p.t === 'out'" class="tool-out" v-html="renderOutPart(p)"></pre>
           <template v-else-if="p.t === 'text'">
@@ -2929,6 +2936,13 @@
                 }
               }
             }
+            // run 结束时清掉可能残留的「运行计时」行（正常情况 tool end 已经删掉）
+            const clearRunTimers = () => {
+              for (let i = el.parts.length - 1; i >= 0; i--) {
+                const p = el.parts[i]
+                if (p && typeof p.uid === 'string' && p.uid.indexOf('run-') === 0) el.parts.splice(i, 1)
+              }
+            }
             if (data.type === 'running') {
               // 工具开始执行：在对应 ref 行点亮一个运行指示灯，消除"卡住"的观感
               clearRunning()
@@ -2942,6 +2956,7 @@
             if (data.type === 'stop') {
               // run 被外部停止（或 watchdog/重试耗尽）：清掉所有 running/retrying 动画标记，让 UI 一致地收尾
               clearRunning()
+              clearRunTimers()
               return
             }
             if (data.type === 'init') {
@@ -2970,12 +2985,28 @@
               return
             }
             if (data.type === 'ref') {
-              clearRunning()
+              if (!data.keepRunning) clearRunning()
               flushText()
               if (data.uid) {
                 const found = el.parts.find((p) => p.uid === data.uid)
-                if (found) { found.c = data.content; found.cls = data.cls || '' }
-                else el.parts.push({ t: 'ref', c: data.content, cls: data.cls || '', uid: data.uid })
+                if (data.remove) {
+                  if (found) el.parts.splice(el.parts.indexOf(found), 1)
+                  return
+                }
+                if (found) {
+                  found.c = data.content
+                  found.cls = data.cls || ''
+                  if (data.running !== undefined) found.running = !!data.running
+                  if (data.stop !== undefined) found.stop = !!data.stop
+                  if (data.callId !== undefined) found.callId = data.callId
+                  if (data.runId !== undefined) found.runId = data.runId
+                } else {
+                  el.parts.push({
+                    t: 'ref', c: data.content, cls: data.cls || '', uid: data.uid,
+                    running: !!data.running, stop: !!data.stop,
+                    callId: data.callId, runId: data.runId
+                  })
+                }
               } else if (data.cls === 'reasoning' && data.content.indexOf('✱') === 0) {
                 // 新的 reasoning 块开始：先收尾上一个块，本块内容稍后由 flushReasoning 另起新块
                 closeReason()
@@ -3055,6 +3086,7 @@
             }
             if (data.type === 'done') {
               clearRunning()
+              clearRunTimers()
               flushText()
               if (data.content) el.parts.push({ t: 'text', c: data.content })
               el.streaming = false
@@ -3095,6 +3127,7 @@
             }
             if (data.type === 'error') {
               clearRunning()
+              clearRunTimers()
               flushText()
               el.streaming = false
               el.errored = true
@@ -3180,6 +3213,24 @@
         }).catch((e) => {
           self.showNotify('stop error: ' + e.message, 'error')
           self.busy = false
+        })
+      },
+      // 只停止某一条正在运行的工具命令（通常是 bash），pi 进程继续执行后续步骤
+      stopTool(p) {
+        const self = this
+        if (!p || p.stopping || !p.runId || !p.callId) return
+        p.stopping = true
+        this.fetchFend('stop_tool', { runId: p.runId, callId: p.callId }, 15000).then((data) => {
+          if (!data || !data.ok) {
+            p.stopping = false
+            self.showNotify('stop command failed: ' + ((data && data.error) || 'unknown'), 'error')
+            return
+          }
+          // 命令若迟迟没有结束，恢复按钮以便重试
+          setTimeout(() => { try { p.stopping = false } catch(e) {} }, 15000)
+        }).catch((e) => {
+          p.stopping = false
+          self.showNotify('stop command error: ' + e.message, 'error')
         })
       },
       qToggle(qi, label) {
@@ -4757,6 +4808,87 @@ const runProcs = {}
 // runId -> { aliveTimer, toolHeartbeat, watchdog }：模块级 registry，让 $fend('stop') 能清除 run 级定时器
 const runTimers = {}
 
+// 正在运行的工具调用登记表（存 $cache，跨 favend 请求共享，$fend('stop_tool') 才能找到目标）
+const piToolsKey = (runId) => { return 'pi_tools_' + runId }
+const readPiTools = (runId) => {
+  try { return JSON.parse($cache.get(piToolsKey(runId)) || '{}') || {} } catch(e) { return {} }
+}
+const writePiTools = (runId, reg) => {
+  try { $cache.set(piToolsKey(runId), JSON.stringify(reg || {})) } catch(e) {}
+}
+
+const listOSProcesses = async () => {
+  if (IS_WIN) {
+    const { stdout } = await execAsync('powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"', 10000)
+    let arr = JSON.parse(stdout || '[]')
+    if (!Array.isArray(arr)) arr = [arr]
+    return arr.map((r) => ({ pid: Number(r.ProcessId), ppid: Number(r.ParentProcessId), cmd: String(r.CommandLine || '') }))
+  }
+  const { stdout } = await execAsync('ps -Ao pid=,ppid=,command=', 5000)
+  const rows = []
+  for (const ln of stdout.split('\n')) {
+    const m = ln.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/)
+    // 命令里可能带换行，ps 会拆成多行：没有 pid 前缀的行接到上一条
+    if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] })
+    else if (rows.length) rows[rows.length - 1].cmd += '\n' + ln
+  }
+  return rows
+}
+
+// 只杀掉 rootPid（pi 进程）下与 command 匹配的那个 shell 子进程及其进程组，
+// 不动 pi 本身：该 tool 会以非零退出码结束，pi 收到结果后继续后面的步骤。
+const killToolProcess = async (rootPid, command) => {
+  const cmd = String(command || '').trim()
+  if (!rootPid) return false
+  let rows = []
+  try { rows = await listOSProcesses() } catch(e) { return false }
+  const children = new Map()
+  for (const r of rows) {
+    if (!children.has(r.ppid)) children.set(r.ppid, [])
+    children.get(r.ppid).push(r)
+  }
+  const desc = []
+  const seen = new Set([Number(rootPid)])
+  const queue = [Number(rootPid)]
+  while (queue.length) {
+    const p = queue.shift()
+    for (const c of (children.get(p) || [])) {
+      if (seen.has(c.pid)) continue
+      seen.add(c.pid)
+      desc.push(c)
+      queue.push(c.pid)
+    }
+  }
+  if (!desc.length) return false
+  const firstLine = cmd.split('\n').map((s) => s.trim()).filter(Boolean)[0] || ''
+  const key = firstLine.slice(0, 60)
+  let target = null
+  if (key) {
+    // 优先 pi 的直接子进程（也就是执行命令的 shell 本身），避免只杀掉命令进程而留下 shell
+    target = desc.find((d) => d.ppid === Number(rootPid) && d.cmd.indexOf(key) >= 0)
+    if (!target) target = desc.find((d) => d.cmd.indexOf(key) >= 0)
+  }
+  if (!target) {
+    // 命令被 shell 改写/截断时退化为唯一的 shell 子进程
+    const shells = desc.filter((d) => d.ppid === Number(rootPid) && /\b(bash|sh)\b/.test(d.cmd))
+    if (shells.length === 1) target = shells[0]
+  }
+  if (!target) return false
+  if (IS_WIN) {
+    try { await execAsync('taskkill /PID ' + target.pid + ' /T /F', 5000) } catch(e) {}
+    return true
+  }
+  try { process.kill(-target.pid, 'SIGTERM') } catch(e) {
+    try { process.kill(target.pid, 'SIGTERM') } catch(e2) {}
+  }
+  setTimeout(() => {
+    try { process.kill(-target.pid, 'SIGKILL') } catch(e) {
+      try { process.kill(target.pid, 'SIGKILL') } catch(e2) {}
+    }
+  }, 800)
+  return true
+}
+
 $fend('start', (data) => {
   if (!data || !data.prompt) return { error: 'prompt is required' }
   const runId = data.runId || Date.now() + '-' + Math.random().toString(36).slice(2, 8)
@@ -4811,6 +4943,7 @@ $fend('start', (data) => {
   let activeModel = modelStr || defModel || ''
   let initShown = false
   const runningTools = {}
+  const timerShown = {}   // callId -> true：计时行是否已经出现（用于结束时就地收尾/删除）
   const seenTools = {}
   const lastToolOut = {}
   // reasoning 块开关：同一消息内可能有多次 thinking（contentIndex 可能复用），
@@ -4905,6 +5038,7 @@ $fend('start', (data) => {
     if (runTimers[runId]) { runTimers[runId].watchdog = null; runTimers[runId].aliveTimer = null; runTimers[runId].toolHeartbeat = null }
     try { delete runProcs[runId] } catch(e) {} try { $cache.delete('pi_run_' + runId) } catch(e) {}
     try { $cache.delete('pi_stop_' + runId) } catch(e) {}
+    try { $cache.delete(piToolsKey(runId)) } catch(e) {}
     // watchdog 超时结束时 pi 可能仍在运行，需要杀掉，否则会继续写 session
     if (payload && payload.timeout) killTree(proc)
     send('done', Object.assign({ steps: stepCount }, payload || {}, payload.tokens ? { tokens: normTokens(payload.tokens) } : {}))
@@ -4919,6 +5053,7 @@ $fend('start', (data) => {
     if (runTimers[runId]) { runTimers[runId].watchdog = null; runTimers[runId].aliveTimer = null; runTimers[runId].toolHeartbeat = null }
     try { delete runProcs[runId] } catch(e) {} try { $cache.delete('pi_run_' + runId) } catch(e) {}
     try { $cache.delete('pi_stop_' + runId) } catch(e) {}
+    try { $cache.delete(piToolsKey(runId)) } catch(e) {}
     killTree(proc)
     send('error', { content: msg })
   }
@@ -5034,6 +5169,11 @@ $fend('start', (data) => {
         sendRef(ref.c, ref.cls)
       }
       runningTools[callId] = { tool: ev.toolName || 'tool', arg: arg, started: Date.now(), lastUpdate: Date.now(), lastOutput: '' }
+      try {
+        const reg = readPiTools(runId)
+        reg[callId] = { tool: ev.toolName || 'tool', arg: arg, started: runningTools[callId].started }
+        writePiTools(runId, reg)
+      } catch(e) {}
       send('running', { tool: ev.toolName || 'tool', callId: callId })
       return
     }
@@ -5050,8 +5190,16 @@ $fend('start', (data) => {
     }
     if (t === 'tool_execution_end') {
       const callId = ev.toolCallId || ev.toolName
+      const rt = runningTools[callId] || {}
       delete runningTools[callId]
       const tname = ev.toolName || 'tool'
+      let stopped = false
+      try {
+        const reg = readPiTools(runId)
+        stopped = !!(reg[callId] && reg[callId].stopped)
+        delete reg[callId]
+        writePiTools(runId, reg)
+      } catch(e) {}
       let out = extractToolText(ev.result)
       // edit/write 后台结果里带有的 diff/patch，一并返回前端显示
       if (!ev.isError && isFileEditTool(tname) && ev.result && ev.result.details) {
@@ -5059,7 +5207,16 @@ $fend('start', (data) => {
         if (patch) out = (out ? out + '\n' : '') + String(patch).slice(0, 6000)
       }
       if (out) emitOut(callId, maskSecrets(out), (d) => { send('out', { content: d }) })
-      sendRef((ev.isError ? '✗ ' : '✓ ') + tname + (ev.isError ? ' failed' : ' done'), 'tool')
+      const secs = rt.started ? Math.floor((Date.now() - rt.started) / 1000) : 0
+      const elapsed = secs > 0 ? ' (' + secs + 's)' : ''
+      if (timerShown[callId]) {
+        delete timerShown[callId]
+        // 计时行只在运行期间存在：结束时删掉它，再用普通完成行收尾（避免日志里留下两行）
+        send('ref', { content: '', cls: 'tool', uid: 'run-' + callId, remove: true })
+        sendRef(stopped ? '⏹ ' + tname + ' stopped' + elapsed : ((ev.isError ? '✗ ' : '✓ ') + tname + (ev.isError ? ' failed' : ' done') + elapsed), 'tool')
+      } else {
+        sendRef(stopped ? '⏹ ' + tname + ' stopped' + elapsed : ((ev.isError ? '✗ ' : '✓ ') + tname + (ev.isError ? ' failed' : ' done') + elapsed), 'tool')
+      }
       return
     }
     if (t === 'bash_execution_update') {
@@ -5400,14 +5557,25 @@ $fend('start', (data) => {
           relaunch()
           return
         }
-        if (now - rt.lastUpdate > 10000) {
-          sendRef('◈ ' + rt.tool + ' running (' + Math.floor((now - rt.started) / 1000) + 's)', 'tool')
-          send('running', { tool: rt.tool, callId: id })
+        // 计时行：同一 uid 原地刷新（不再每 15s 追加一行），超过 30s 后附带单独停止按钮
+        const secs = Math.floor((now - rt.started) / 1000)
+        if (secs >= 10) {
+          const firstTimer = !timerShown[id]
+          timerShown[id] = true
+          const canStop = secs >= 30 && /bash|shell|exec/i.test(String(rt.tool || ''))
+          const refPayload = {
+            content: '◈ ' + rt.tool + ' running (' + secs + 's)',
+            cls: 'tool', uid: 'run-' + id, running: true,
+            stop: canStop, callId: canStop ? id : undefined
+          }
+          // 第一次出现时让前端清掉原工具行上的运行点；之后的原地刷新保留各自工具的点
+          if (!firstTimer) refPayload.keepRunning = true
+          send('ref', refPayload)
           rt.lastUpdate = now
         }
         if (rt.lastOutput) emitOut(id, maskSecrets(rt.lastOutput), (d) => { send('out', { content: d }) })
       }
-    }, 15000)
+    }, 1000)
     runTimers[runId] = runTimers[runId] || {}
     runTimers[runId].aliveTimer = aliveTimer
     runTimers[runId].toolHeartbeat = toolHeartbeat
@@ -5459,11 +5627,42 @@ $fend('stop', async (data) => {
     try { delete runProcs[data.runId] } catch(e) {}
     try { $cache.delete('pi_run_' + data.runId) } catch(e) {}
     try { $cache.delete('pi_compact_' + data.runId) } catch(e) {}
+    try { $cache.delete(piToolsKey(data.runId)) } catch(e) {}
     // Signal the running handler to stop retrying
     try { $cache.set('pi_stop_' + data.runId, '1') } catch(e) {}
     return { ok: true, mode: 'run' }
   }
   return { ok: false, error: 'no active run' }
+})
+
+// 单独停止一条正在运行的 bash 命令（不影响 pi 进程，随后 pi 会继续后续步骤）
+$fend('stop_tool', async (data) => {
+  if (!data || !data.runId || !data.callId) return { ok: false, error: 'runId and callId are required' }
+  const runId = String(data.runId)
+  const callId = String(data.callId)
+  const reg = readPiTools(runId)
+  const ent = reg[callId]
+  if (!ent) return { ok: false, error: 'command is not running' }
+  if (ent.stopped) return { ok: false, error: 'already stopping' }
+  const rp = runProcs[runId] || $cache.get('pi_run_' + runId)
+  const rootPid = rp && rp.pid
+  if (!rootPid) return { ok: false, error: 'run process not found' }
+  let killed = false
+  try { killed = await killToolProcess(rootPid, ent.arg) } catch(e) {}
+  if (!killed) return { ok: false, error: 'command process not found (it may have already exited)' }
+  ent.stopped = true
+  ent.stoppedAt = Date.now()
+  reg[callId] = ent
+  writePiTools(runId, reg)
+  const secs = Math.floor((Date.now() - (ent.started || Date.now())) / 1000)
+  try {
+    $ws.sse(APP_CH, JSON.stringify({
+      type: 'ref', runId: runId,
+      content: '⏹ stopping ' + ent.tool + ' (' + secs + 's)…',
+      cls: 'tool', uid: 'run-' + callId, running: true, keepRunning: true, stop: false
+    }))
+  } catch(e) {}
+  return { ok: true }
 })
 
 // Manually compact an existing session's context via pi's RPC mode.
