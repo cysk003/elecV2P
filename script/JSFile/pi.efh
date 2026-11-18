@@ -921,7 +921,7 @@
     </button>
   </div>
 
-  <div class="messages" ref="messagesEl">
+  <div class="messages" ref="messagesEl" @scroll="onMessagesScroll">
     <div class="msg-loading" v-if="switching"><span class="spin"></span> Loading session...</div>
     <template v-else>
     <div class="welcome" v-if="!messages.length">
@@ -941,7 +941,7 @@
         <div v-for="(p, pi) in m.parts" :key="pi">
           <div v-if="p.t === 'ref'" :class="['ref', p.cls || refClass(p.c), p.running ? 'generating' : '']" :style="p.cls === 'reasoning' && p.body ? 'cursor: pointer;' : ''" @click="p.cls === 'reasoning' && p.body ? (p.open = p.open === undefined ? false : !p.open) : null">{{ p.c }}<button v-if="p.stopping" class="run-stop" disabled>Stopping…</button><button v-else-if="p.stop" class="run-stop" @click.stop="stopTool(p)" title="只停止这条命令，随后继续运行">Stop</button><span v-if="p.running" class="run-dot"></span></div>
           <div v-if="p.t === 'ref' && p.cls === 'reasoning' && p.body && p.open !== false" class="reasoning-body" @scroll="reasoningScroll($event)">{{ p.body }}</div>
-          <pre v-else-if="p.t === 'out'" class="tool-out" v-html="renderOutPart(p)"></pre>
+          <pre v-else-if="p.t === 'out'" class="tool-out" @scroll="onToolOutScroll($event)" v-html="renderOutPart(p)"></pre>
           <template v-else-if="p.t === 'text'">
             <div v-for="(v, vi) in mdViews(p, m.streaming)" :key="vi" class="stream-par" :class="p.cls || ''">
               <pre v-if="v.plain" class="stream-text">{{ v.text }}</pre>
@@ -1171,7 +1171,7 @@
         sseMain: null, mainReady: false, sseHandlers: {}, switching: false,
         providerOverlay: false, providerList: [], providerKeys: {}, providerHidden: {}, providerBusy: false,
         delHideConfirm: { show: false, name: '', provider: null },
-        scrollPending: false,
+        scrollPending: false, autoStick: true,
         currentProvider: '', provSeq: 0,
         omniCurrent: false, omniStatus: 'checking…', omniRunning: false,
         elecV2PTheme: null, currentTheme: null, themeSelectorOpen: false, themeNavIdx: 0,
@@ -1780,7 +1780,7 @@
           self.switching = false
           if (data && Array.isArray(data.messages)) {
             self.messages = data.messages
-            self.scrollBottom()
+            self.scrollBottom(true)
           }
         }).catch(() => { self.switching = false })
       },
@@ -1938,7 +1938,7 @@
             + '\n\n当前语速：' + this.speechRate()
             + '\n\n> 机械感最低的是名字带 **Natural / Neural / Online / 自然** 的音色。macOS 可在「系统设置 → 辅助功能 → 朗读内容 → 系统声音 → 管理声音」下载“婷婷（增强）”等高品质声音；Windows / Edge 直接就有“Xiaoxiao Online (Natural)”这类神经音色。'
           this.messages.push({ role: 'assistant', parts: [{ t: 'text', c: md }], streaming: false })
-          this.$nextTick(() => { this.scrollBottom() })
+          this.$nextTick(() => { this.scrollBottom(true) })
           return
         }
         if (/^rate\b/i.test(arg)) {
@@ -2722,7 +2722,20 @@
           el.setSelectionRange(start + 1, start + 1)
         })
       },
-      scrollBottom() {
+      // 用户手动滚动主消息区：离开底部后暂停自动跟随，滚回底部（24px 内）恢复
+      onMessagesScroll(ev) {
+        const el = ev && ev.target
+        if (!el) return
+        this.autoStick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+      },
+      // 工具输出块同理：用户单独向上滚动后，不再把这个输出块拉回底部
+      onToolOutScroll(ev) {
+        const el = ev && ev.target
+        if (!el) return
+        el.__stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+      },
+      scrollBottom(force) {
+        if (force) this.autoStick = true
         // rAF 节流：事件洪水时多帧内的滚动请求合并为一次，避免每条消息强制 reflow
         if (this._sbRaf) return
         const self = this
@@ -2730,12 +2743,14 @@
           self._sbRaf = null
           const el = self.$refs.messagesEl
           if (!el) return
-          el.scrollTop = el.scrollHeight
+          // 用户手动上滚后不要抢回滚动位置；只有仍在底部附近时才跟随
+          if (self.autoStick !== false) el.scrollTop = el.scrollHeight
           const tos = el.querySelectorAll('.tool-out')
           if (tos.length) {
             // 只滚最后一个工具输出块，不再遍历全部
             const last = tos[tos.length - 1]
-            last.scrollTop = last.scrollHeight
+            if (last.__stick === undefined) last.__stick = true
+            if (last.__stick) last.scrollTop = last.scrollHeight
           }
         })
       },
@@ -2842,7 +2857,7 @@
           const cmdLines = cmds.map((c) => `• /${c.name}  —  ${c.description}`).join('  \n  ')
           const extra = `\n\n💡  小提示：\n  /new  开启新 session（保留当前不重置）\n  /clear  清空前端显示（不切 session）\n  /session  打开左侧历史面板，方向键选中，Enter 载入\n  /model  切换模型（可带参数或不带参数）\n  /theme  打开主题选择弹窗（可带参数直接应用）\n  /voice  列出/切换朗读音色（/voice 3 、 /voice rate 1.1）\n  /compact  压缩上下文节省 token`
           this.messages.push({ role: 'assistant', parts: [{ t: 'text', c: (cmdLines || 'No commands') + extra }], streaming: false })
-          this.$nextTick(() => { this.scrollBottom() })
+          this.$nextTick(() => { this.scrollBottom(true) })
           return
         }
         if (/^\/(new|clear|session|model|theme|voice|help)\b/.test(prompt)) {
@@ -2859,7 +2874,7 @@
         this.messages.push({ role: 'user', content: prompt })
         const el = Vue.reactive({ role: 'assistant', parts: [], streaming: true })
         this.messages.push(el)
-        this.scrollBottom()
+        this.scrollBottom(true)
         const startTime = Date.now()
         const runId = Date.now() + '-' + Math.random().toString(36).slice(2, 8)
         this.runId = runId
@@ -3302,6 +3317,7 @@
         // 只清空前端的显示内容，不开启新 session
         this.stopSpeak()
         this.messages = []
+        this.autoStick = true
         this.qEl = null
         this.question = null
         this.qSel = []
@@ -3322,6 +3338,7 @@
         const self = this
         const compactId = 'compact-' + Date.now()
         this.compacting = true
+        this.autoStick = true
         this.compactElapsed = 0
         this.compactMsgIdx = -1
         if (this.compactTimer) clearInterval(this.compactTimer)
@@ -3833,17 +3850,22 @@ const readBadModels = () => {
     return v && typeof v === 'object' ? v : {}
   } catch(e) { return {} }
 }
+// 收藏的模型：不做持久化移除，也不从前端列表移除
+const isFavoriteModel = (key) => {
+  if (!key) return false
+  try {
+    const raw = $store.get('pi_favorite_models')
+    const favorites = raw ? (Array.isArray(raw) ? raw : JSON.parse(raw)) : []
+    return Array.isArray(favorites) && favorites.indexOf(key) >= 0
+  } catch(e) { return false }
+}
 const markBadModels = (keys) => {
   const list = Array.isArray(keys) ? keys : [keys]
   if (!list.length) return false
-  // Skip models that are in favorites
-  const favRaw = $store.get('pi_favorite_models')
-  const favorites = favRaw ? (Array.isArray(favRaw) ? favRaw : JSON.parse(favRaw)) : []
-  const favSet = new Set(favorites)
   const bad = readBadModels()
   let changed = false
   for (const k of list) {
-    if (k && !bad[k] && !favSet.has(k)) { bad[k] = Date.now(); changed = true }
+    if (k && !bad[k] && !isFavoriteModel(k)) { bad[k] = Date.now(); changed = true }
   }
   if (changed) { try { $store.set(BAD_MODELS_KEY, JSON.stringify(bad)) } catch(e) {} }
   return changed
@@ -5388,23 +5410,29 @@ $fend('start', (data) => {
     lastErrKey = key
     lastErrAt2 = Date.now()
     let removed = false
+    let goneReason = 'removed'
     if (mk && /\b(400|404|410|502)\b/.test(etxt)) {
+      const fav = isFavoriteModel(mk)
       const newly = markBadModels([mk])
-      sendRef('⚠ ' + mk + ' unavailable · ' + (newly ? 'removed from list' : 'already removed') + ' · ' + errLine, 'info')
-      send('model_removed', { model: mk })  // drop from frontend list even if no further switch happens
+      sendRef('⚠ ' + mk + ' unavailable · ' + (fav ? 'favorite kept in list' : (newly ? 'removed from list' : 'already removed')) + ' · ' + errLine, 'info')
+      // 收藏的模型只切换，不从前端列表移除
+      if (fav) goneReason = 'switch'
+      else send('model_removed', { model: mk })  // drop from frontend list even if no further switch happens
       removed = true
     } else if (mk && isHardFail(etxt)) {
       hardFails[mk] = (hardFails[mk] || 0) + 1
       if (hardFails[mk] >= 2) {
+        const fav = isFavoriteModel(mk)
         const newly = markBadModels([mk])
-        sendRef('⚠ ' + mk + ' repeatedly failing (' + hardFails[mk] + 'x 5xx/network) · ' + (newly ? 'removed from list' : 'already removed') + ' · ' + errLine, 'info')
-        send('model_removed', { model: mk })
+        sendRef('⚠ ' + mk + ' repeatedly failing (' + hardFails[mk] + 'x 5xx/network) · ' + (fav ? 'favorite kept in list' : (newly ? 'removed from list' : 'already removed')) + ' · ' + errLine, 'info')
+        if (fav) goneReason = 'switch'
+        else send('model_removed', { model: mk })
         removed = true
       }
     }
     if (removed) {
       // model is gone for good — switch to the next available model instead of retrying the same one
-      if (!switchToNextModel(etxt, 'removed')) fail(errLine)
+      if (!switchToNextModel(etxt, goneReason)) fail(errLine)
       return
     }
     if (switchOnly(etxt)) {
