@@ -5290,13 +5290,15 @@ $fend('start', (data) => {
       if (compactTick) { clearInterval(compactTick); compactTick = null }
       const r = ev.result || {}
       const sum = typeof r.summary === 'string' && r.summary ? String(r.summary).trim() : ''
-      if (sum) send('out', { content: maskSecrets(sum) })
       let line = '✓ context compacted' + (compactTag ? ' (' + compactTag + ')' : '')
       compactTag = ''
       if (r.tokensBefore && r.estimatedTokensAfter) {
         line += ' · ' + Math.round(r.tokensBefore / 1000) + 'k → ' + Math.round(r.estimatedTokensAfter / 1000) + 'k tokens'
       }
       sendRef(line, 'info')
+      // 摘要走 text part，按 markdown 渲染（与手动 Compact 一致）。
+      // 不用 out：out 只做 HTML 转义，且受 260px 高度限制，还会粘到上一段工具输出后面。
+      if (sum) send('text', { content: '\n\n📌 Summary\n\n' + maskSecrets(sum) })
       return
     }
     if (t === 'auto_retry_start') { autoRetryCount++; sendRef('↻ retrying…', 'info retrying'); return }
