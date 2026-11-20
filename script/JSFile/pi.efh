@@ -921,7 +921,7 @@
     </button>
   </div>
 
-  <div class="messages" ref="messagesEl" @scroll="onMessagesScroll">
+  <div class="messages" ref="messagesEl" @scroll="onMessagesScroll" @wheel="onUserScroll" @touchstart="onUserScroll" @touchmove="onUserScroll" @mousedown="onUserScroll">
     <div class="msg-loading" v-if="switching"><span class="spin"></span> Loading session...</div>
     <template v-else>
     <div class="welcome" v-if="!messages.length">
@@ -940,8 +940,8 @@
       <template v-else>
         <div v-for="(p, pi) in m.parts" :key="pi">
           <div v-if="p.t === 'ref'" :class="['ref', p.cls || refClass(p.c), p.running ? 'generating' : '']" :style="p.cls === 'reasoning' && p.body ? 'cursor: pointer;' : ''" @click="p.cls === 'reasoning' && p.body ? (p.open = p.open === undefined ? false : !p.open) : null">{{ p.c }}<button v-if="p.stopping" class="run-stop" disabled>Stopping…</button><button v-else-if="p.stop" class="run-stop" @click.stop="stopTool(p)" title="只停止这条命令，随后继续运行">Stop</button><span v-if="p.running" class="run-dot"></span></div>
-          <div v-if="p.t === 'ref' && p.cls === 'reasoning' && p.body && p.open !== false" class="reasoning-body" @scroll="reasoningScroll($event)">{{ p.body }}</div>
-          <pre v-else-if="p.t === 'out'" class="tool-out" @scroll="onToolOutScroll($event)" v-html="renderOutPart(p)"></pre>
+          <div v-if="p.t === 'ref' && p.cls === 'reasoning' && p.body && p.open !== false" class="reasoning-body" @scroll="reasoningScroll($event)" @wheel="onUserScroll" @touchstart="onUserScroll" @touchmove="onUserScroll" @mousedown="onUserScroll">{{ p.body }}</div>
+          <pre v-else-if="p.t === 'out'" class="tool-out" @scroll="onToolOutScroll($event)" @wheel="onUserScroll" @touchstart="onUserScroll" @touchmove="onUserScroll" @mousedown="onUserScroll" v-html="renderOutPart(p)"></pre>
           <template v-else-if="p.t === 'text'">
             <div v-for="(v, vi) in mdViews(p, m.streaming)" :key="vi" class="stream-par" :class="p.cls || ''">
               <pre v-if="v.plain" class="stream-text">{{ v.text }}</pre>
@@ -2722,17 +2722,44 @@
           el.setSelectionRange(start + 1, start + 1)
         })
       },
-      // 用户手动滚动主消息区：离开底部后暂停自动跟随，滚回底部（24px 内）恢复
+      // 只有用户主动向上滚动才暂停跟随：滚轮 / 触摸 / 拖动滚动条。
+      // 内容变高（尤其 bash/read 一次吐出很多行）也会触发 scroll 事件，不能当成用户上滚。
+      onUserScroll(ev) {
+        const el = ev && ev.currentTarget
+        if (!el) return
+        if (ev.type === 'touchstart') {
+          el.__touchY = ev.touches && ev.touches[0] ? ev.touches[0].clientY : undefined
+          return
+        }
+        let up = true
+        if (ev.type === 'wheel') up = Number(ev.deltaY || 0) < 0
+        else if (ev.type === 'touchmove') {
+          const y = ev.touches && ev.touches[0] ? ev.touches[0].clientY : undefined
+          up = el.__touchY !== undefined && y !== undefined && y > el.__touchY
+          el.__touchY = y
+        } else if (ev.type === 'mousedown') {
+          // 正文里的点击（选中文本等）不算滚动意图，只有点在滚动条区域才算
+          const rect = el.getBoundingClientRect()
+          if (ev.clientX - rect.left < el.clientWidth) return
+          if (el.scrollTop + el.clientHeight >= el.scrollHeight - 24) return
+        }
+        // 容器本身不可滚动时（内容还没撑开），滚轮/触摸不该取消跟随
+        if (!up || el.scrollHeight <= el.clientHeight + 1) return
+        if (el === this.$refs.messagesEl) this.autoStick = false
+        else el.__stick = false
+      },
+      // scroll 事件只负责「滚回底部（24px 内）后恢复跟随」，
+      // 暂停必须由 onUserScroll 的明确用户操作触发，否则大量输出会误判为手动上滚。
       onMessagesScroll(ev) {
         const el = ev && ev.target
         if (!el) return
-        this.autoStick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+        if (el.scrollTop + el.clientHeight >= el.scrollHeight - 24) this.autoStick = true
       },
       // 工具输出块同理：用户单独向上滚动后，不再把这个输出块拉回底部
       onToolOutScroll(ev) {
         const el = ev && ev.target
         if (!el) return
-        el.__stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+        if (el.scrollTop + el.clientHeight >= el.scrollHeight - 24) el.__stick = true
       },
       scrollBottom(force) {
         if (force) this.autoStick = true
@@ -3538,9 +3565,9 @@
         this.useOmniRoute()
       },
       reasoningScroll(ev) {
-        // 用户手动上滚离开底部时暂停跟随，滚回底部(24px内)恢复
+        // 同消息区：只在这里恢复跟随，暂停交给 onUserScroll 的用户操作判定
         const el = ev.target
-        el.__stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 24
+        if (el.scrollTop + el.clientHeight >= el.scrollHeight - 24) el.__stick = true
       },
       scrollReasoningBottom() {
         if (this.scrollPending) return
