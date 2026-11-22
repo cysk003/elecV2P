@@ -3203,16 +3203,18 @@ $fend('ensure_opencode', async (data) => {
       ssePush({ type: 'error', content: msg })
       return { ok: false, error: msg }
     }
-    // v1 的 npm 包是 opencode-ai，v2 是 @opencode/cli；两者共用 opencode 命令，必须先卸载 v1
-    const uninstallCmd = 'npm uninstall -g opencode-ai'
-    const installCmd = 'npm install -g @opencode/cli@latest --loglevel=verbose'
-    const INSTALL_CMD = process.platform === 'win32'
-      ? uninstallCmd + ' & ' + installCmd
-      : uninstallCmd + ' >/dev/null 2>&1; ' + installCmd
+    // v1 的 npm 包是 opencode-ai，v2 是 @opencode/cli；两者共用 opencode 命令。
+    // 只有检测到 v1 才卸载，避免 Docker 冷启动时空跑一次 npm 请求。
+    const cmds = []
+    if (r.ok && !isOcV2(r.version)) cmds.push('npm uninstall -g opencode-ai')
+    cmds.push('npm install -g @opencode/cli@latest --loglevel=verbose --no-audit --no-fund')
+    const sep = process.platform === 'win32' ? ' & ' : ' ; '
+    const INSTALL_CMD = cmds.join(sep)
+    const INSTALL_TIMEOUT = 600000
     ssePush({ type: 'cmd', content: INSTALL_CMD })
     const proc = spawn(process.platform === 'win32' ? process.env.COMSPEC : 'sh',
       process.platform === 'win32' ? ['/d', '/s', '/c', INSTALL_CMD + ' 2>&1'] : ['-c', INSTALL_CMD + ' 2>&1'],
-      { timeout: 120000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+      { timeout: INSTALL_TIMEOUT, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const fullLog = []
     const sendProgress = (text) => {
       const lines = stripAnsi(text.toString()).split('\n').filter(Boolean)
@@ -3228,7 +3230,7 @@ $fend('ensure_opencode', async (data) => {
     }
     proc.stdout.on('data', sendProgress)
     proc.stderr.on('data', sendProgress)
-    proc.on('close', async (code) => {
+    proc.on('close', async (code, signal) => {
       try {
         if (code === 0) {
           const vr = await resolveOcVersion(3)
@@ -3243,7 +3245,11 @@ $fend('ensure_opencode', async (data) => {
           ssePush({ type: 'done', version: version })
         } else {
           ssePush({ type: 'full_log', content: fullLog.join('\n') })
-          ssePush({ type: 'error', content: 'npm install failed (code ' + code + ')' })
+          const why = signal ? 'signal ' + signal : 'code ' + code
+          const hint = signal === 'SIGTERM'
+            ? ' npm 安装被超时终止（' + (INSTALL_TIMEOUT / 1000) + 's）。Docker 网络慢时可手动安装：https://opencode.ai/docs/'
+            : ''
+          ssePush({ type: 'error', content: 'npm install failed (' + why + ').' + hint })
         }
       } catch(e) {
         ssePush({ type: 'full_log', content: fullLog.join('\n') })
