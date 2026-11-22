@@ -942,6 +942,11 @@
             self.messages = data.messages
             self.scrollBottom()
           }
+          // 历史请求顺带返回当前用量，刷新页面后 ctx 直接使用后端计算的 used
+          if (data && typeof data.used === 'number') {
+            self.applyCtx({ type: 'ctx', used: data.used })
+            if (!self.ctxLimit) self.syncCtx(id)
+          }
         }).catch(() => { self.switching = false })
       },
       deleteLocalSession(id) {
@@ -1498,8 +1503,7 @@
       },
       compactChat() {
         const self = this
-        this.messages = []
-        this.todos = []
+        // 保留当前页面内容，压缩过程与结果在当前对话末尾追加显示
         this.inputText = '/compact'
         this.$nextTick(() => {
           self.send()
@@ -1712,11 +1716,7 @@
         const self = this
         this.fetchFend('session_ctx', { id: sessionId, model: this.currentModel || this.ctxModel }, 12000).then((data) => {
           if (!data) return
-          if (data.limit) self.ctxLimit = data.limit
-          if (!self.ctxLimit) return
-          self.ctxUsed = data.used || 0
-          self.ctxPct = Math.round((self.ctxUsed || 0) / self.ctxLimit * 1000) / 10
-          try { localStorage.setItem('aichat_oc_ctx_limit', String(self.ctxLimit)) } catch(e) {}
+          if (data.used) self.applyCtx({ type: 'ctx', used: data.used, limit: data.limit || 0 })
         }).catch(() => {})
       },
     },
@@ -2046,21 +2046,41 @@ $fend('ctxinfo', (data) => {
   })
 })
 
+// 从消息列表计算当前上下文占用：从最新往前找；assistant 用其 tokens 总量，
+// compaction（压缩完成）用其 tokens.input 作为压缩后的新上下文基线
+const usageFromMsgs = (msgs) => {
+  const tokenCtx = (t) => {
+    if (!t) return 0
+    return Number(t.input) || 0
+  }
+  if (!msgs || !msgs.length) return 0
+  // 按时间排序
+  const sorted = msgs.slice().sort((a, b) => {
+    const ta = msgTime(a), tb = msgTime(b)
+    if (ta !== tb) return ta - tb
+    return 0
+  })
+  let total = 0
+  for (let i = 0; i < sorted.length; i++) {
+    const m = sorted[i]
+    if (!m) continue
+    const type = m.type
+    if (type === 'compaction' && m.tokens && m.tokens.input != null) {
+      // 压缩后基线重置
+      total = Number(m.tokens.input) || 0
+      continue
+    }
+    if (type === 'assistant' && m.tokens) {
+      total += tokenCtx(m.tokens)
+    }
+  }
+  return total
+}
+
 const getSessionUsage = async (sessionId) => {
   if (!sessionId) return 0
-  // v2: 从最新消息往前找；assistant 用其 tokens 总量（≈ 当前上下文占用），
-  // compaction（压缩完成）用其 tokens.input 作为压缩后的新上下文基线
   try {
-    const msgs = await fetchSessionMessages(sessionId)
-    if (!msgs.length) return 0
-    msgs.sort((a, b) => msgTime(a) - msgTime(b))
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]
-      if (!m) continue
-      if (m.type === 'assistant' && m.tokens) return tokenTotal(m.tokens)
-      if (m.type === 'compaction' && m.tokens && m.tokens.input != null) return Number(m.tokens.input) || 0
-    }
-    return 0
+    return usageFromMsgs(await fetchSessionMessages(sessionId))
   } catch(e) {
     return 0
   }
@@ -2157,6 +2177,7 @@ const convSessionMessages = (msgs) => {
   let curTokens = 0
   let curModel = ''
   let curErrored = false
+  let prevCum = 0
   const finalize = () => {
     if (!cur) return
     let meta = curErrored ? '⚠ ' : '✓ '
@@ -2201,6 +2222,7 @@ const convSessionMessages = (msgs) => {
       const parts = [{ t: 'ref', c: '✂ context compacted', cls: 'info' }]
       if (summary) parts.push({ t: 'text', c: summary, cls: 'compact' })
       out.push({ role: 'assistant', content: '', parts: parts })
+      prevCum = 0
       continue
     }
     if (type === 'assistant') {
@@ -2238,16 +2260,23 @@ const convSessionMessages = (msgs) => {
           }
           if (typeof out2 === 'object' && out2 !== null) out2 = JSON.stringify(out2)
           const status = state.status || ''
-          if (status === 'error') {
-            cur.parts.push({ t: 'ref', c: '✗ ' + (p.name || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
-          } else {
-            cur.parts.push({ t: 'ref', c: '✓ ' + (p.name || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
-          }
+          // 与流式一致：◈ 工具 · 参数 → 输出内容 → ✓/✗ 收尾标识
+          const toolName = p.name || 'tool'
+          cur.parts.push({ t: 'ref', c: '◈ ' + toolName + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
           if (out2) cur.parts.push({ t: 'out', c: maskSecrets(out2) })
+          if (status === 'error') {
+            cur.parts.push({ t: 'ref', c: '✗ ' + toolName + ' failed', cls: 'tool' })
+          } else {
+            cur.parts.push({ t: 'ref', c: '✓ ' + toolName + ' done', cls: 'tool' })
+          }
         }
       }
       const tTotal = tokenTotal(tokens)
-      if (tTotal) curTokens = tTotal
+      // 历史元信息中不计入 cache.read，避免 token 数虚高
+      const tTotalNoCache = (Number(tokens.input) || 0) + (Number(tokens.output) || 0) + (Number(tokens.reasoning) || 0)
+      const delta = tTotalNoCache > prevCum ? tTotalNoCache - prevCum : tTotalNoCache
+      if (delta) curTokens += delta
+      prevCum = tTotalNoCache
       if (model && model.id) curModel = (model.providerID || 'opencode') + '/' + model.id
       if (m.outcome === 'failed') curErrored = true
     }
@@ -2258,13 +2287,14 @@ const convSessionMessages = (msgs) => {
 
 $fend('session_messages', async (data) => {
   const id = data && data.id
-  if (!id) return { messages: [] }
+  if (!id) return { messages: [], used: 0 }
   try {
     const msgs = await fetchSessionMessages(id)
     msgs.sort((a, b) => msgTime(a) - msgTime(b))
-    return { messages: convSessionMessages(msgs) }
+    // 顺带返回当前用量：刷新页面加载历史时前端直接更新 ctx，不依赖单独的 session_ctx 请求
+    return { messages: convSessionMessages(msgs), used: usageFromMsgs(msgs) }
   } catch(e) {
-    return { messages: [] }
+    return { messages: [], used: 0 }
   }
 })
 
@@ -2277,7 +2307,7 @@ const sseChat = (runId, obj) => {
   $ws.sse('opencode-main', JSON.stringify(Object.assign({ runId: runId }, obj)))
 }
 
-const runCliMode = (data, runId) => {
+const runCliMode = async (data, runId) => {
   const prompt = data.prompt
   const sessionId = data.session || ''
   const modelStr = (data.model || '').replace(/\r/g, '')
@@ -2295,6 +2325,7 @@ const runCliMode = (data, runId) => {
   let streamEnded = false
   let stepCount = 0
   let tokens = null
+  let beforeUsed = 0  // compact 前的上下文用量（用于压缩前后对比提示）
   let model = modelStr || null
   let knownSession = !!sessionId
   let runSessionId = ''
@@ -2320,6 +2351,12 @@ const runCliMode = (data, runId) => {
     }
   }
   let watchdog = null
+  let ctxAfterCompact = false  // compact 后基线期标志，防止 usage.updated 覆盖
+  let compactBaseline = 0  // compact 后的基线 token 用量
+
+  try { const vr = await resolveOcVersion(2); } catch(e) {}
+  this.ocVersion = vr.ok ? vr.version : ''
+
   let aliveTimer = null
   let toolHeartbeat = null
   const kickWatchdog = () => {
@@ -2599,6 +2636,9 @@ $fend('start', async (data) => {
           sendRef('✓ reasoning done', 'reasoning')
         }
       }
+      // compact 后基线期标志，防止 usage.updated 覆盖压缩后的基线
+      let ctxAfterCompact = false
+      let compactBaseline = 0
       let tokens = null
       let watchdog = null
       runWatchdogs[runId] = {
@@ -2834,29 +2874,38 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
               seenTools[callId] = true
               sendRef('◈ ' + toolName + (rt && rt.arg ? ' · ' + maskSecrets(rt.arg) : ''), 'tool')
             }
-            sendRef('✓ ' + toolName + ' done', 'tool')
+            // 先推工具内容再收尾，保证 ✓ done 在输出之后
             const out = toolOut(p.content)
             if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
+            sendRef('✓ ' + toolName + ' done', 'tool')
           } else {
-            sendRef('✗ ' + toolName + ' failed', 'tool')
             const out = toolOut(p.content || p.error)
             if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
+            sendRef('✗ ' + toolName + ' failed', 'tool')
           }
           return
         }
         if (ev.type === 'session.usage.updated') {
           if (p.tokens) {
             tokens = p.tokens
-            const used = (p.tokens.input || 0) + (p.tokens.output || 0) + (p.tokens.reasoning || 0) + ((p.tokens.cache && p.tokens.cache.read) || 0)
-            if (used) emitCtx(used)
+            // 上下文占用只计 input，避免 cache/output/reasoning 导致数值虚高
+            const used = p.tokens.input || 0
+            // compact 后基线期：若 used > compactBaseline，说明是旧的大值，跳过更新以保持压缩后的基线
+            if (used && (!ctxAfterCompact || used <= compactBaseline || compactBaseline === 0)) {
+              emitCtx(used)
+            }
           }
           return
         }
         if (ev.type === 'session.step.ended') {
           if (p.tokens) {
             tokens = p.tokens
-            const used = (p.tokens.input || 0) + (p.tokens.output || 0) + (p.tokens.reasoning || 0) + ((p.tokens.cache && p.tokens.cache.read) || 0)
-            if (used) emitCtx(used)
+            // 上下文占用只计 input
+            const used = p.tokens.input || 0
+            // compact 后基线期：同 usage.updated 逻辑
+            if (used && (!ctxAfterCompact || used <= compactBaseline || compactBaseline === 0)) {
+              emitCtx(used)
+            }
           }
           return
         }
@@ -2883,15 +2932,27 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
           return
         }
         if (ev.type === 'session.compaction.ended') {
-          sendRef('✓ context compacted', 'info')
           const mdl = p.model || {}
           if (mdl.id) model = (mdl.providerID || 'opencode') + '/' + mdl.id
           // v2 压缩后不发 usage.updated；ended 瞬间 compaction 消息 tokens 还是执行中间态，
-          // 延迟落库后再拉取压缩后的上下文占用（前端 ctx 处理不依赖 runId，晚到也能更新）
-          setTimeout(() => {
-            getSessionUsage(sessionId).then((used) => { if (used) emitCtx(used) }).catch(() => {})
+          // 延迟落库后再拉取压缩后的用量，给出 N → M tokens 对比提示，然后收尾
+          setTimeout(async () => {
+            let after = 0
+            try { after = await getSessionUsage(sessionId) } catch(e) {}
+            if (after) {
+              emitCtx(after)
+              compactBaseline = after
+              ctxAfterCompact = true
+              // 30 秒后自动恢复正常累计，或在下一轮对话开始时自动清除
+              setTimeout(() => { ctxAfterCompact = false; compactBaseline = 0 }, 30000)
+            }
+            if (beforeUsed && after && after < beforeUsed) {
+              sendRef('✂ compacted: ' + beforeUsed.toLocaleString() + ' → ' + after.toLocaleString() + ' tokens', 'info')
+            } else {
+              sendRef('✓ context compacted', 'info')
+            }
+            finish({ content: '', model: model, tokens: tokens })
           }, 2000)
-          finish({ content: '', model: model, tokens: tokens })
           return
         }
         if (ev.type === 'todo.updated' || ev.type === 'session.todo.updated') {
@@ -2909,7 +2970,8 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         try {
           if (cmdName === 'compact' || cmdName === 'summarize') {
             // v2: 专有端点 POST /api/session/<id>/compact，异步执行，
-            // 完成后由 SSE 的 session.execution.succeeded 结束本次流
+            // 完成后由 SSE 的 session.compaction.started/ended 结束本次流
+            try { beforeUsed = await getSessionUsage(sessionId) } catch(e) {}
             const sum = await api('POST', '/session/' + sessionId + '/compact', {})
             if (sum.status !== 200) {
               fail('compact failed: ' + sum.body.slice(0, 120))
