@@ -151,6 +151,7 @@
     }
     .msg .stream-text { white-space: pre-wrap; word-break: break-word; line-height: 1.7; }
     .stream-par.reasoning { color: #a78bfa; font-style: italic; opacity: .75; font-size: 13px; }
+    .stream-par.compact { color: #93c5fd; font-size: 13px; }
     .cursor { display: inline-block; width: 7px; height: 16px; background: var(--ac); animation: blink .7s infinite; vertical-align: text-bottom; margin-left: 2px; }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
     .reasoning { margin-bottom: 8px; }
@@ -708,7 +709,7 @@
         runMode: 'serve', modeOverlay: false, modeBusy: false,
         notifyMsg: '', notifyShow: false, loading: false,
         notifyType: 'ok',
-        ocVersion: '', installOverlay: true, installErr: '', installProgress: 'This may take a minute', installLog: [], installCmd: '', installEs: null, installBusy: false,
+        ocVersion: '', installOverlay: true, installErr: '', installProgress: 'This may take a minute', installLog: [], installCmd: '', installBusy: false,
         ctxUsed: 0, ctxLimit: 0, ctxPct: 0, ctxModel: '',
         question: null, qSel: [], qCustom: [], qSubmitting: false, qEl: null,
         permission: null, permissionSubmitting: false,
@@ -1198,15 +1199,7 @@
               self.todos = data.data || []
             }
             if (data.type === 'ctx') {
-              self.ctxUsed = data.used || 0
-              if (data.limit > 0) self.ctxLimit = data.limit
-              if (data.pct !== undefined && data.pct !== null) self.ctxPct = data.pct
-              else if (self.ctxLimit) self.ctxPct = Math.round((self.ctxUsed || 0) / self.ctxLimit * 1000) / 10
-              if (data.model) self.ctxModel = data.model
-              try {
-                if (self.ctxLimit) localStorage.setItem('aichat_oc_ctx_limit', String(self.ctxLimit))
-                if (self.ctxModel) localStorage.setItem('aichat_oc_ctx_model', self.ctxModel)
-              } catch(e) {}
+              self.applyCtx(data)
             }
             if (data.type === 'session') {
               self.sessionId = data.id || ''
@@ -1283,7 +1276,12 @@
               delete self.sseHandlers[runId]
               if (!el.stopped) {
                 let meta = Math.round((Date.now() - startTime) / 1000) + 's'
-                if (data.tokens) meta += ' | ⚙ ' + data.tokens.total + ' tokens'
+                if (data.tokens) {
+                  // v2 tokens 无 total 字段：{ input, output, reasoning, cache: { read } }
+                  const tk = data.tokens
+                  const total = tk.total != null ? Number(tk.total) : (Number(tk.input) || 0) + (Number(tk.output) || 0) + (Number(tk.reasoning) || 0) + ((tk.cache && Number(tk.cache.read)) || 0)
+                  if (total) meta += ' | ⚙ ' + total.toLocaleString() + ' tokens'
+                }
                 if (data.steps) meta += ' | ' + data.steps + ' steps'
                 if (data.model) meta += ' | ' + data.model
                 if (data.timeout) {
@@ -1515,58 +1513,14 @@
         this.installLog = []
         this.installCmd = ''
         this.installProgress = 'This may take a minute'
-        if (this.installEs) { try { this.installEs.close() } catch(e) {} }
-        const instId = Date.now() + '-' + Math.random().toString(36).slice(2, 8)
-        const installEs = new EventSource('/sse/elecV2P/' + instId)
-        this.installEs = installEs
-        installEs.onmessage = (e) => {
-          try {
-            const d = JSON.parse(e.data)
-            if (d.type === 'cmd') {
-              self.installCmd = d.content
-              return
-            }
-            if (d.type === 'full_log') {
-              self.installLog = String(d.content).split('\n').filter(Boolean)
-              self.$nextTick(() => {
-                const el = self.$refs.installLog
-                if (el) el.scrollTop = el.scrollHeight
-              })
-              return
-            }
-            if (d.type === 'progress') {
-              self.installLog.push(String(d.content).replace(/\s+/g, ' ').trim())
-              if (self.installLog.length > 200) self.installLog.shift()
-              self.$nextTick(() => {
-                const el = self.$refs.installLog
-                if (el) el.scrollTop = el.scrollHeight
-              })
-            }
-            if (d.type === 'done') {
-              installEs.close()
-              self.installEs = null
-              self.installBusy = false
-              if (d.version) self.ocVersion = String(d.version).replace(/^opencode\s*/i, '')
-              self.initApp()
-            }
-            if (d.type === 'error') {
-              installEs.close()
-              self.installEs = null
-              self.installBusy = false
-              self.installErr = d.content
-            }
-          } catch(e) {}
-        }
-        this.fetchFend('ensure_opencode', { installId: instId }, 120000).then((data) => {
+        // 安装进度复用 opencode-main SSE（sseMain），不再另开随机通道；
+        // 后端消息带 install: true 标记，由 mainEs.onmessage 路由到 onInstallMsg
+        this.fetchFend('ensure_opencode', {}, 120000).then((data) => {
           if (data && data.ok && !data.installing) {
-            installEs.close()
-            self.installEs = null
             self.installBusy = false
             if (data.version) self.ocVersion = String(data.version).replace(/^opencode\s*/i, '')
             self.initApp()
           } else if (data && !data.ok && data.error) {
-            installEs.close()
-            self.installEs = null
             self.installBusy = false
             self.installErr = data.error
           } else if (data && data.ok && data.installing) {
@@ -1578,6 +1532,40 @@
         }).catch((e) => {
           self.installBusy = false
         })
+      },
+      onInstallMsg(d) {
+        const self = this
+        if (!self.installBusy) return
+        if (d.type === 'cmd') {
+          self.installCmd = d.content
+          return
+        }
+        if (d.type === 'full_log') {
+          self.installLog = String(d.content).split('\n').filter(Boolean)
+          self.$nextTick(() => {
+            const el = self.$refs.installLog
+            if (el) el.scrollTop = el.scrollHeight
+          })
+          return
+        }
+        if (d.type === 'progress') {
+          self.installLog.push(String(d.content).replace(/\s+/g, ' ').trim())
+          if (self.installLog.length > 200) self.installLog.shift()
+          self.$nextTick(() => {
+            const el = self.$refs.installLog
+            if (el) el.scrollTop = el.scrollHeight
+          })
+          return
+        }
+        if (d.type === 'done') {
+          self.installBusy = false
+          if (d.version) self.ocVersion = String(d.version).replace(/^opencode\s*/i, '')
+          self.initApp()
+        }
+        if (d.type === 'error') {
+          self.installBusy = false
+          self.installErr = d.content
+        }
       },
       retryInstall() {
         const self = this
@@ -1706,6 +1694,19 @@
           if (self.sessionId) self.syncCtx(self.sessionId)
         }).catch(() => {})
       },
+      applyCtx(d) {
+        const self = this
+        if (!d || d.type !== 'ctx') return
+        self.ctxUsed = d.used || 0
+        if (d.limit > 0) self.ctxLimit = d.limit
+        if (d.pct !== undefined && d.pct !== null) self.ctxPct = d.pct
+        else if (self.ctxLimit) self.ctxPct = Math.round((self.ctxUsed || 0) / self.ctxLimit * 1000) / 10
+        if (d.model) self.ctxModel = d.model
+        try {
+          if (self.ctxLimit) localStorage.setItem('aichat_oc_ctx_limit', String(self.ctxLimit))
+          if (self.ctxModel) localStorage.setItem('aichat_oc_ctx_model', self.ctxModel)
+        } catch(e) {}
+      },
       syncCtx(sessionId) {
         if (!sessionId) return
         const self = this
@@ -1730,6 +1731,15 @@
           const d = JSON.parse(e.data)
           if (d.runId && self.sseHandlers[d.runId]) {
             self.sseHandlers[d.runId](d)
+            return
+          }
+          // ctx 帧全局生效（如 compact 收尾后的用量更新可能晚于该 runId handler 清理）
+          if (d.type === 'ctx') {
+            self.applyCtx(d)
+            return
+          }
+          if (d.install) {
+            self.onInstallMsg(d)
             return
           }
           if (d.type === 'init') {
@@ -1771,7 +1781,8 @@ const maskSecrets = (s) => {
 
 const toolArg = (inp) => {
   const i = inp || {}
-  let arg = i.command || i.filePath || i.path || i.url || i.pattern || i.query || ''
+  // skill 工具的参数为 { id: '<skill id>' }
+  let arg = i.command || i.filePath || i.path || i.url || i.pattern || i.query || i.id || ''
   if (i.filePath) {
     const off = Number(i.offset)
     const lim = Number(i.limit)
@@ -2037,18 +2048,19 @@ $fend('ctxinfo', (data) => {
 
 const getSessionUsage = async (sessionId) => {
   if (!sessionId) return 0
-  // v2: 取最后一条 assistant 消息的 tokens（input+output+reasoning+cache.read ≈ 当前上下文占用）
+  // v2: 从最新消息往前找；assistant 用其 tokens 总量（≈ 当前上下文占用），
+  // compaction（压缩完成）用其 tokens.input 作为压缩后的新上下文基线
   try {
     const msgs = await fetchSessionMessages(sessionId)
-    let used = 0
+    if (!msgs.length) return 0
+    msgs.sort((a, b) => msgTime(a) - msgTime(b))
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]
-      if (!m || m.type !== 'assistant' || !m.tokens) continue
-      const tk = m.tokens
-      used = (tk.input || 0) + (tk.output || 0) + (tk.reasoning || 0) + ((tk.cache && tk.cache.read) || 0)
-      break
+      if (!m) continue
+      if (m.type === 'assistant' && m.tokens) return tokenTotal(m.tokens)
+      if (m.type === 'compaction' && m.tokens && m.tokens.input != null) return Number(m.tokens.input) || 0
     }
-    return used
+    return 0
   } catch(e) {
     return 0
   }
@@ -2132,6 +2144,13 @@ const msgTime = (m) => {
   return Number(m && (m.created_at || m.time)) || 0
 }
 
+// v2 tokens 结构为 { input, output, reasoning, cache: { read, write } }，无 total 字段
+const tokenTotal = (t) => {
+  if (!t) return 0
+  if (t.total != null) return Number(t.total) || 0
+  return (Number(t.input) || 0) + (Number(t.output) || 0) + (Number(t.reasoning) || 0) + ((t.cache && Number(t.cache.read)) || 0)
+}
+
 const convSessionMessages = (msgs) => {
   const out = []
   let cur = null
@@ -2175,6 +2194,15 @@ const convSessionMessages = (msgs) => {
       out.push({ role: 'assistant', content: '', parts: [{ t: 'ref', c: '🔄 Model switched to ' + (model.id || 'unknown'), cls: 'info' }] })
       continue
     }
+    if (type === 'compaction') {
+      // 压缩摘要（完成后消息带 summary 字段）
+      finalize()
+      const summary = m.summary || ''
+      const parts = [{ t: 'ref', c: '✂ context compacted', cls: 'info' }]
+      if (summary) parts.push({ t: 'text', c: summary, cls: 'compact' })
+      out.push({ role: 'assistant', content: '', parts: parts })
+      continue
+    }
     if (type === 'assistant') {
       const content = m.content || []
       const tokens = m.tokens || {}
@@ -2197,8 +2225,7 @@ const convSessionMessages = (msgs) => {
           const inp = state.input || {}
           let arg = ''
           if (typeof inp === 'object' && inp !== null) {
-            arg = inp.command || inp.input || inp.args || inp.cmd || inp.script || ''
-            if (typeof arg === 'object' && arg !== null) arg = JSON.stringify(arg)
+            arg = toolArg(inp)
           } else if (typeof inp === 'string') {
             arg = inp
           }
@@ -2219,7 +2246,8 @@ const convSessionMessages = (msgs) => {
           if (out2) cur.parts.push({ t: 'out', c: maskSecrets(out2) })
         }
       }
-      if (tokens && tokens.total) curTokens = tokens.total
+      const tTotal = tokenTotal(tokens)
+      if (tTotal) curTokens = tTotal
       if (model && model.id) curModel = (model.providerID || 'opencode') + '/' + model.id
       if (m.outcome === 'failed') curErrored = true
     }
@@ -2355,9 +2383,10 @@ const runCliMode = (data, runId) => {
     const part = ev.part || {}
     if (t === 'step_start') { stepCount++; return }
     if (t === 'step_finish') {
-      if (part.tokens && part.tokens.total) {
+      if (part.tokens) {
         tokens = part.tokens
-        emitCtx(part.tokens.total)
+        const used = tokenTotal(part.tokens)
+        if (used) emitCtx(used)
       }
       return
     }
@@ -2679,7 +2708,7 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
       })
 
       // v2 事件流: session.text.delta / session.reasoning.* / session.tool.* / session.step.* / session.usage.updated / session.execution.*
-      const handleEvent = (ev) => {
+      const handleEvent = async (ev) => {
         const p = ev.data || ev.properties || {}
         const sid2 = p.sessionID || ev.sessionID
         if (sid2 && sessionId && sid2 !== sessionId) return
@@ -2723,17 +2752,32 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
           }
           return
         }
+        // v2 reasoning 事件的 ordinal 每条 assistant 消息从 0 重新计数，
+        // key 必须拼上 assistantMessageID，否则第二步起不再显示 ✱/✓ 标识
+        const reasonEvtKey = (pd) => { return (pd.assistantMessageID || pd.messageID || 'msg') + ':' + (pd.ordinal != null ? pd.ordinal : '0') }
         if (ev.type === 'session.reasoning.started') {
-          reasonStart(p.ordinal != null ? String(p.ordinal) : (p.assistantMessageID || '_'))
+          reasonStart(reasonEvtKey(p))
           return
         }
         if (ev.type === 'session.reasoning.delta') {
-          reasonStart(p.ordinal != null ? String(p.ordinal) : '_')
+          reasonStart(reasonEvtKey(p))
           if (p.delta) sseChat(runId, { type: 'text', content: p.delta, cls: 'reasoning' })
           return
         }
         if (ev.type === 'session.reasoning.ended') {
-          reasonDone(p.ordinal != null ? String(p.ordinal) : '_')
+          reasonDone(reasonEvtKey(p))
+          return
+        }
+        // v2 的 reasoning.ended 在正文/工具调用开始后才发（甚至可能不来），
+        // 正文一开流即视为本条消息的 reasoning 全部结束，保证 ✓ 标识位置正确
+        if (ev.type === 'session.text.started') {
+          const pre = (p.assistantMessageID || p.messageID || 'msg') + ':'
+          for (const k in reasoningSeen) {
+            if (k.indexOf(pre) === 0 && reasoningSeen[k] !== 'done') {
+              reasoningSeen[k] = 'done'
+              sendRef('✓ reasoning done', 'reasoning')
+            }
+          }
           return
         }
         if (ev.type === 'session.text.delta') {
@@ -2743,6 +2787,14 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         if (ev.type === 'session.tool.input.started') {
           const callId = p.id || ('tool#' + (++toolSeq))
           runningTools[callId] = { tool: p.name || 'tool', arg: '', started: Date.now(), lastUpdate: Date.now() }
+          // 工具开始也视为 reasoning 结束（工具调用前 reasoning.ended 可能还未到）
+          const pre = (p.assistantMessageID || p.messageID || 'msg') + ':'
+          for (const k in reasoningSeen) {
+            if (k.indexOf(pre) === 0 && reasoningSeen[k] !== 'done') {
+              reasoningSeen[k] = 'done'
+              sendRef('✓ reasoning done', 'reasoning')
+            }
+          }
           return
         }
         if (ev.type === 'session.tool.input.ended') {
@@ -2821,6 +2873,27 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         if (ev.type === 'session.renamed') {
           return
         }
+        if (ev.type === 'session.compaction.started') {
+          sendRef('✂ context compacting…', 'info')
+          return
+        }
+        if (ev.type === 'session.compaction.delta') {
+          // 压缩摘要流式输出（字段为 text）
+          if (p.text) sseChat(runId, { type: 'text', content: p.text, cls: 'compact' })
+          return
+        }
+        if (ev.type === 'session.compaction.ended') {
+          sendRef('✓ context compacted', 'info')
+          const mdl = p.model || {}
+          if (mdl.id) model = (mdl.providerID || 'opencode') + '/' + mdl.id
+          // v2 压缩后不发 usage.updated；ended 瞬间 compaction 消息 tokens 还是执行中间态，
+          // 延迟落库后再拉取压缩后的上下文占用（前端 ctx 处理不依赖 runId，晚到也能更新）
+          setTimeout(() => {
+            getSessionUsage(sessionId).then((used) => { if (used) emitCtx(used) }).catch(() => {})
+          }, 2000)
+          finish({ content: '', model: model, tokens: tokens })
+          return
+        }
         if (ev.type === 'todo.updated' || ev.type === 'session.todo.updated') {
           sseChat(runId, { type: 'todo', data: p.todos || [] })
           return
@@ -2835,13 +2908,14 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         const cmdArgs = cmdSpace >= 0 ? cmdLine.slice(cmdSpace + 1).trim() : ''
         try {
           if (cmdName === 'compact' || cmdName === 'summarize') {
-            // v2: 无独立 summarize HTTP 端点，改用内置 /compact 命令
-            const sum = await api('POST', '/session/' + sessionId + '/command', { command: 'compact', arguments: '' })
-            if (sum.status !== 200 && sum.status !== 204) {
+            // v2: 专有端点 POST /api/session/<id>/compact，异步执行，
+            // 完成后由 SSE 的 session.execution.succeeded 结束本次流
+            const sum = await api('POST', '/session/' + sessionId + '/compact', {})
+            if (sum.status !== 200) {
               fail('compact failed: ' + sum.body.slice(0, 120))
             } else {
-              sendRef('✂ context compacting…', 'info')
-              finish({ content: '', model: model, tokens: tokens })
+              // 进度提示由 SSE 的 session.compaction.started/ended 事件发出，这里只续期 watchdog
+              runWatchdogs[runId].kick()
             }
           } else if (cmdName === 'undo' || cmdName === 'redo') {
             const msgs = await api('GET', '/session/' + sessionId + '/message?limit=2')
@@ -3002,27 +3076,26 @@ const resolveOcVersion = (tries) => {
   })
 }
 
+// 安装进度统一走 opencode-main 通道（消息带 install: true 标记），不再另开随机 SSE 通道
 $fend('ensure_opencode', async (data) => {
-  const runId = data && data.installId
   const r = await resolveOcVersion(2)
   if (r.ok) {
     const version = r.version
     console.log('[ensure_opencode] version:', version)
-    if (runId) $ws.sse(runId, JSON.stringify({ type: 'done', version: version }))
     return { ok: true, installing: false, version: version }
   }
-  if (!runId) return { error: 'no installId' }
+  const ssePush = (obj) => { try { $ws.sse('opencode-main', JSON.stringify(Object.assign({ install: true }, obj))) } catch(e) {} }
   try {
     const freeMem = require('os').freemem()
     const freeMB = Math.round(freeMem / 1024 / 1024)
     if (freeMem < 1024 * 1024 * 1024) {
       const msg = '当前可用内存 ' + freeMB + 'M，内存过小，opencode 无法使用'
       console.log('[ensure_opencode] memory too low:', freeMB + 'M')
-      $ws.sse(runId, JSON.stringify({ type: 'error', content: msg }))
+      ssePush({ type: 'error', content: msg })
       return { ok: false, error: msg }
     }
     const INSTALL_CMD = 'npm install -g opencode-ai@latest --loglevel=verbose'
-    $ws.sse(runId, JSON.stringify({ type: 'cmd', content: INSTALL_CMD }))
+    ssePush({ type: 'cmd', content: INSTALL_CMD })
     const proc = spawn(process.platform === 'win32' ? process.env.COMSPEC : 'sh',
       process.platform === 'win32' ? ['/d', '/s', '/c', INSTALL_CMD + ' 2>&1'] : ['-c', INSTALL_CMD + ' 2>&1'],
       { timeout: 120000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -3035,7 +3108,7 @@ $fend('ensure_opencode', async (data) => {
         if (line) {
           fullLog.push(line)
           if (fullLog.length > 2000) fullLog.splice(0, fullLog.length - 2000)
-          $ws.sse(runId, JSON.stringify({ type: 'progress', content: line }))
+          ssePush({ type: 'progress', content: line })
         }
       }
     }
@@ -3048,24 +3121,24 @@ $fend('ensure_opencode', async (data) => {
           const version = vr.ok ? vr.version : 'unknown'
           console.log('[npm install] done, version:', version)
           if (!vr.ok) console.log('[npm install] version check failed:', vr.error && vr.error.message)
-          $ws.sse(runId, JSON.stringify({ type: 'full_log', content: fullLog.join('\n') }))
-          $ws.sse(runId, JSON.stringify({ type: 'done', version: version }))
+          ssePush({ type: 'full_log', content: fullLog.join('\n') })
+          ssePush({ type: 'done', version: version })
         } else {
-          $ws.sse(runId, JSON.stringify({ type: 'full_log', content: fullLog.join('\n') }))
-          $ws.sse(runId, JSON.stringify({ type: 'error', content: 'npm install failed (code ' + code + ')' }))
+          ssePush({ type: 'full_log', content: fullLog.join('\n') })
+          ssePush({ type: 'error', content: 'npm install failed (code ' + code + ')' })
         }
       } catch(e) {
-        $ws.sse(runId, JSON.stringify({ type: 'full_log', content: fullLog.join('\n') }))
-        $ws.sse(runId, JSON.stringify({ type: 'error', content: e.message }))
+        ssePush({ type: 'full_log', content: fullLog.join('\n') })
+        ssePush({ type: 'error', content: e.message })
       }
     })
     proc.on('error', (e) => {
-      $ws.sse(runId, JSON.stringify({ type: 'full_log', content: fullLog.join('\n') }))
-      $ws.sse(runId, JSON.stringify({ type: 'error', content: e.message }))
+      ssePush({ type: 'full_log', content: fullLog.join('\n') })
+      ssePush({ type: 'error', content: e.message })
     })
     return { ok: true, installing: true }
   } catch(e) {
-    $ws.sse(runId, JSON.stringify({ type: 'error', content: e.message }))
+    ssePush({ type: 'error', content: e.message })
     return { ok: true, installing: true }
   }
 })
