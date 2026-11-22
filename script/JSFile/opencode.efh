@@ -150,6 +150,7 @@
       padding: 6px 10px; margin: 4px 0; line-height: 1.5; max-height: 260px; overflow-y: auto;
     }
     .msg .stream-text { white-space: pre-wrap; word-break: break-word; line-height: 1.7; }
+    .stream-par.reasoning { color: #a78bfa; font-style: italic; opacity: .75; font-size: 13px; }
     .cursor { display: inline-block; width: 7px; height: 16px; background: var(--ac); animation: blink .7s infinite; vertical-align: text-bottom; margin-left: 2px; }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
     .reasoning { margin-bottom: 8px; }
@@ -434,7 +435,7 @@
     <div class="sub">Current mode: {{ runMode }}</div>
     <div class="mode-item" :class="{cur: runMode==='serve'}">
       <div class="m-name">serve<span class="m-cur" v-if="runMode==='serve'">(current)</span></div>
-      <div class="m-desc">Resident background server (<code>opencode serve</code> :14096). Streaming responses, session history and context bar available. Uses extra memory (~100MB+).</div>
+      <div class="m-desc">Resident background service (<code>opencode service</code>, dynamic port). Streaming responses, session history and context bar available. Uses extra memory (~100MB+).</div>
     </div>
     <div class="mode-item" :class="{cur: runMode==='run'}">
       <div class="m-name">run<span class="m-cur" v-if="runMode==='run'">(current)</span></div>
@@ -1159,19 +1160,8 @@
         this.todos = []
         if (this.currentModel) this.ctxModel = this.currentModel
 
-        let textBuf = ''
-        let textFlush = null
-        const flushText = () => {
-          if (textFlush) { clearTimeout(textFlush); textFlush = null }
-          if (!textBuf) return
-          const last = el.parts[el.parts.length - 1]
-          if (last && last.t === 'text') {
-            last.c += textBuf
-          } else {
-            el.parts.push({ t: 'text', c: textBuf })
-          }
-          textBuf = ''
-        }
+        // 文本按 SSE 到达顺序即时渲染；cls 相同（普通/ reasoning）才追加到上一段，否则新开一段
+        const flushText = () => {}
 
         const onMsg = (data) => {
           try {
@@ -1195,8 +1185,14 @@
               else el.parts.push({ t: 'out', c: data.content })
             }
             if (data.type === 'text') {
-              textBuf += data.content
-              if (!textFlush) textFlush = setTimeout(flushText, 50)
+              const cls = data.cls || ''
+              const last = el.parts[el.parts.length - 1]
+              if (last && last.t === 'text' && (last.cls || '') === cls) {
+                last.c += data.content
+              } else {
+                el.parts.push({ t: 'text', c: data.content, cls: cls })
+                self.scrollBottom()
+              }
             }
             if (data.type === 'todo') {
               self.todos = data.data || []
@@ -1550,7 +1546,7 @@
               installEs.close()
               self.installEs = null
               self.installBusy = false
-              if (d.version) self.ocVersion = d.version
+              if (d.version) self.ocVersion = String(d.version).replace(/^opencode\s*/i, '')
               self.initApp()
             }
             if (d.type === 'error') {
@@ -1566,7 +1562,7 @@
             installEs.close()
             self.installEs = null
             self.installBusy = false
-            if (data.version) self.ocVersion = data.version
+            if (data.version) self.ocVersion = String(data.version).replace(/^opencode\s*/i, '')
             self.initApp()
           } else if (data && !data.ok && data.error) {
             installEs.close()
@@ -1755,7 +1751,6 @@
 // @grant persist
 const { spawn, exec } = require('child_process')
 
-const OC_HOST = 'http://localhost:14096'
 const OC_BIN = 'opencode'
 
 const stripAnsi = (s) => { return String(s).replace(/\u001b\[[0-9;]*[a-zA-Z]/g, '').replace(/\r/g, '') }
@@ -1800,6 +1795,36 @@ let serverProc = null
 const redirCmd = (cmd) => { return cmd + ' 2>' + DEVNULL }
 const sleep = (ms) => { return new Promise((resolve) => { setTimeout(resolve, ms) }) }
 
+let _svcUrl = ''
+let _svcAuth = ''
+let _svcFetchAt = 0
+let serverReadyAt = 0
+let serverReadyOk = false
+
+const serverReady = async (force) => {
+  const now = Date.now()
+  if (!force && now - serverReadyAt < 5000) return serverReadyOk
+  try {
+    const svc = await getServiceInfo()
+    if (!svc.url) { serverReadyOk = false; serverReadyAt = now; return false }
+    const url = new URL(svc.url)
+    const httpMod = url.protocol === 'https:' ? require('https') : require('http')
+    return await new Promise((resolve) => {
+      const req = httpMod.get({ hostname: url.hostname, port: url.port || (url.protocol === 'https:' ? 443 : 80), path: '/api/session', headers: { 'Authorization': svc.auth } }, (res) => {
+        serverReadyOk = res.statusCode === 200
+        serverReadyAt = now
+        resolve(serverReadyOk)
+      })
+      req.on('error', () => { serverReadyOk = false; serverReadyAt = now; resolve(false) })
+      req.setTimeout(3000, () => { req.destroy(); serverReadyOk = false; serverReadyAt = now; resolve(false) })
+    })
+  } catch(e) {
+    serverReadyOk = false
+    serverReadyAt = now
+    return false
+  }
+}
+
 const execAsync = (cmd, timeout) => {
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout: timeout || 15000, windowsHide: true, encoding: 'utf-8', maxBuffer: 5 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -1809,41 +1834,66 @@ const execAsync = (cmd, timeout) => {
   })
 }
 
-const httpGet = (path, port, timeout) => {
-  return new Promise((resolve) => {
-    const httpMod = require('http')
-    const req = httpMod.get({ host: '127.0.0.1', port: port || 14096, path: path }, (res) => {
+const getServiceInfo = async () => {
+  const now = Date.now()
+  if (_svcUrl && now - _svcFetchAt < 30000) return { url: _svcUrl, auth: _svcAuth }
+  try {
+    const r = await execAsync(OC_BIN + ' service status', 5000)
+    const out = (r.stdout || '').trim()
+    const m = out.match(/^https?:\/\/[^\s]+/)
+    if (m) {
+      _svcUrl = m[0]
+      const fs = require('fs')
+      const svcCfg = JSON.parse(fs.readFileSync(require('os').homedir() + '/.config/opencode/service.json', 'utf8'))
+      const pwd = svcCfg.password
+      if (pwd) _svcAuth = 'Basic ' + Buffer.from('opencode:' + pwd).toString('base64')
+      _svcFetchAt = now
+      return { url: _svcUrl, auth: _svcAuth }
+    }
+  } catch(e) {}
+  return { url: '', auth: '' }
+}
+
+const apiRequest = async (method, path, body) => {
+  const info = await getServiceInfo()
+  if (!info.url) throw new Error('opencode service not running')
+  const url = new URL(info.url)
+  return new Promise((resolve, reject) => {
+    const httpMod = url.protocol === 'https:' ? require('https') : require('http')
+    const payload = body ? JSON.stringify(body) : ''
+    const opts = {
+      host: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: '/api' + path,
+      method: method,
+      headers: Object.assign({
+        'Authorization': info.auth
+      }, body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
+    }
+    const req = httpMod.request(opts, (res) => {
       let buf = ''
       res.on('data', (c) => { buf += c })
-      res.on('end', () => { resolve({ status: res.statusCode, body: buf }) })
+      res.on('end', () => { 
+        try {
+          const parsed = JSON.parse(buf)
+          resolve(parsed.data !== undefined ? parsed.data : parsed)
+        } catch(e) {
+          resolve({ status: res.statusCode, body: buf })
+        }
+      })
     })
-    req.on('error', () => { resolve({ status: 0, body: '' }) })
-    req.setTimeout(timeout || 8000, () => { req.destroy(); resolve({ status: 0, body: '' }) })
+    req.on('error', reject)
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')) })
+    if (body) req.write(payload)
+    req.end()
   })
 }
 
-const httpGetJson = (path, port, timeout) => {
-  return httpGet(path, port || 14096, timeout).then((r) => {
-    if (r.status !== 200 || !r.body || !r.body.trim()) return null
-    try { return JSON.parse(r.body) } catch(e) { return null }
-  })
-}
-
-let serverReadyAt = 0
-let serverReadyOk = false
-const serverReady = (force) => {
-  const now = Date.now()
-  if (!force && now - serverReadyAt < 5000) return Promise.resolve(serverReadyOk)
-  return httpGet('/', 14096, 3000).then((r) => {
-    serverReadyOk = r.status === 200
-    serverReadyAt = Date.now()
-    return serverReadyOk
-  }).catch(() => {
-    serverReadyOk = false
-    serverReadyAt = Date.now()
-    return false
-  })
-}
+const apiGet = (path) => apiRequest('GET', path)
+const apiPost = (path, body) => apiRequest('POST', path, body)
+const apiPut = (path, body) => apiRequest('PUT', path, body)
+const apiPatch = (path, body) => apiRequest('PATCH', path, body)
+const apiDelete = (path) => apiRequest('DELETE', path)
 
 const getRunMode = () => {
   try { return $store.get('opencode_run_mode') === 'run' ? 'run' : 'serve' } catch(e) { return 'serve' }
@@ -1913,42 +1963,15 @@ const toolOut = (out) => {
 }
 
 const ensureServer = async () => {
-  let pid = ''
-  try {
-    pid = $store.get('opencode_server_pid')
-    if (pid && isAlive(pid) && (await serverReady())) return true
-  } catch(e) {}
-  if (await serverReady()) {
-    try {
-      const r = await execAsync(IS_WIN ? 'netstat -ano | findstr :14096' : 'lsof -t -iTCP:14096', 5000)
-      const found = r.stdout
-      const fpid = String(found).trim().split(/\s+/).pop()
-      if (fpid && fpid !== pid) $store.set('opencode_server_pid', fpid)
-    } catch(e) {}
-    return true
+  // v2: 后台服务由 `opencode service` 管理，动态端口，不再自行 spawn `opencode serve --port 14096`
+  if (await serverReady()) return true
+  try { await execAsync(OC_BIN + ' service start', 10000) } catch(e) {}
+  const deadline = Date.now() + 15000
+  while (Date.now() < deadline) {
+    if (await serverReady(true)) return true
+    await sleep(1000)
   }
-  try {
-    const shell = process.env.COMSPEC || process.env.SHELL || (IS_WIN ? 'cmd.exe' : '/bin/sh')
-    const shellArgs = IS_WIN ? ['/d', '/s', '/c', OC_BIN + ' serve --port 14096'] : ['-c', OC_BIN + ' serve --port 14096']
-    const env = Object.assign({}, process.env, { NODE_OPTIONS: '--no-warnings' })
-    const proc = spawn(shell, shellArgs, { detached: !IS_PAAS, stdio: 'ignore', windowsHide: true, env: env })
-    serverProc = proc
-    proc.on('exit', (code, signal) => {
-      console.log('[opencode] server exited', code, signal)
-      if (serverProc === proc) serverProc = null
-      try { $store.set('opencode_server_pid', '') } catch(e) {}
-    })
-    if (IS_PAAS) proc.unref()
-    $store.set('opencode_server_pid', String(proc.pid))
-    const deadline = Date.now() + 15000
-    while (Date.now() < deadline) {
-      if (await serverReady(true)) return true
-      await sleep(1000)
-    }
-    return false
-  } catch(e) {
-    return false
-  }
+  return false
 }
 
 const shutdownServer = () => {
@@ -1978,40 +2001,30 @@ const parseModel = (modelStr) => {
 }
 
 const ctxLimitMem = {}
-const getCtxLimit = (modelStr) => {
-  return new Promise((resolve) => {
-    const pm = parseModel(modelStr)
-    if (!pm.mid) return resolve(0)
-    const memKey = pm.pid + '/' + pm.mid
-    if (ctxLimitMem[memKey] > 0) return resolve(ctxLimitMem[memKey])
-    const cacheKey = 'aichat_ctx_limit_' + pm.pid + '_' + pm.mid
-    try {
-      const cached = Number($store.get(cacheKey))
-      if (cached > 0) { ctxLimitMem[memKey] = cached; return resolve(cached) }
-    } catch(e) {}
-    const httpMod = require('http')
-    const req = httpMod.get({ host: '127.0.0.1', port: 14096, path: '/provider' }, (res) => {
-      let buf = ''
-      res.on('data', (c) => { buf += c })
-      res.on('end', () => {
-        try {
-          const all = JSON.parse(buf).all || []
-          for (let i = 0; i < all.length; i++) {
-            const prov = all[i]
-            if (prov.id === pm.pid && prov.models && prov.models[pm.mid] && prov.models[pm.mid].limit && prov.models[pm.mid].limit.context) {
-              const limit = prov.models[pm.mid].limit.context
-              ctxLimitMem[memKey] = limit
-              try { $store.set(cacheKey, String(limit)) } catch(e2) {}
-              return resolve(limit)
-            }
-          }
-        } catch(e) {}
-        resolve(0)
-      })
-    })
-    req.on('error', () => { resolve(0) })
-    req.setTimeout(8000, () => { req.destroy(); resolve(0) })
-  })
+const getCtxLimit = async (modelStr) => {
+  const pm = parseModel(modelStr)
+  if (!pm.mid) return 0
+  const memKey = pm.pid + '/' + pm.mid
+  if (ctxLimitMem[memKey] > 0) return ctxLimitMem[memKey]
+  const cacheKey = 'aichat_ctx_limit_' + pm.pid + '_' + pm.mid
+  try {
+    const cached = Number($store.get(cacheKey))
+    if (cached > 0) { ctxLimitMem[memKey] = cached; return cached }
+  } catch(e) {}
+  // v2: GET /api/model 返回含 limit.context 的模型列表
+  try {
+    const models = await apiGet('/model')
+    const list = Array.isArray(models) ? models : (models && models.data) || []
+    for (const m of list) {
+      if ((m.providerID === pm.pid) && (m.modelID === pm.mid || m.id === pm.mid) && m.limit && m.limit.context) {
+        const limit = m.limit.context
+        ctxLimitMem[memKey] = limit
+        try { $store.set(cacheKey, String(limit)) } catch(e2) {}
+        return limit
+      }
+    }
+  } catch(e) {}
+  return 0
 }
 
 $fend('ctxinfo', (data) => {
@@ -2022,38 +2035,23 @@ $fend('ctxinfo', (data) => {
   })
 })
 
-const getSessionUsage = (sessionId) => {
-  return new Promise((resolve) => {
-    if (!sessionId) return resolve(0)
-    const httpMod = require('http')
+const getSessionUsage = async (sessionId) => {
+  if (!sessionId) return 0
+  // v2: 取最后一条 assistant 消息的 tokens（input+output+reasoning+cache.read ≈ 当前上下文占用）
+  try {
+    const msgs = await fetchSessionMessages(sessionId)
     let used = 0
-    let usedTime = -1
-    let offset = 0
-    const LIMIT = 100
-    const MAXPAGE = 20
-    const fetchPage = () => {
-      const req = httpMod.get({ host: '127.0.0.1', port: 14096, path: '/session/' + encodeURIComponent(sessionId) + '/message?limit=' + LIMIT + '&offset=' + offset }, (res) => {
-        let buf = ''
-        res.on('data', (c) => { buf += c })
-        res.on('end', () => {
-          let msgs
-          try { msgs = JSON.parse(buf) } catch(e) { return resolve(used) }
-          if (!Array.isArray(msgs) || !msgs.length) return resolve(used)
-          for (let i = 0; i < msgs.length; i++) {
-            const t = msgs[i].info && msgs[i].info.tokens ? msgs[i].info.tokens.total : 0
-            const tm = msgs[i].time || msgs[i].created_at || 0
-            if (tm >= usedTime && t > 0) { usedTime = tm; used = t }
-          }
-          if (msgs.length < LIMIT || offset >= MAXPAGE * LIMIT) return resolve(used)
-          offset += msgs.length
-          fetchPage()
-        })
-      })
-      req.on('error', () => resolve(used))
-      req.setTimeout(10000, () => { req.destroy(); resolve(used) })
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (!m || m.type !== 'assistant' || !m.tokens) continue
+      const tk = m.tokens
+      used = (tk.input || 0) + (tk.output || 0) + (tk.reasoning || 0) + ((tk.cache && tk.cache.read) || 0)
+      break
     }
-    fetchPage()
-  })
+    return used
+  } catch(e) {
+    return 0
+  }
 }
 
 $fend('session_ctx', (data) => {
@@ -2066,29 +2064,72 @@ $fend('session_ctx', (data) => {
   })
 })
 
-const fetchSessionMessages = (sessionId) => {
-  return new Promise((resolve) => {
-    if (!sessionId) return resolve([])
-    const httpMod = require('http')
-    const req = httpMod.get({ host: '127.0.0.1', port: 14096, path: '/session/' + encodeURIComponent(sessionId) + '/message?limit=500' }, (res) => {
-      let buf = ''
-      res.on('data', (c) => { buf += c })
-      res.on('end', () => {
-        let msgs
-        try { msgs = JSON.parse(buf) } catch(e) { return resolve([]) }
-        if (!Array.isArray(msgs)) return resolve([])
-        resolve(msgs)
+const fetchSessionMessages = async (sessionId) => {
+  if (!sessionId) return []
+  let svc = { url: '', auth: '' }
+  try {
+    svc = await getServiceInfo()
+  } catch(e) {}
+  if (!svc.url) {
+    svc.url = 'http://127.0.0.1:49374'
+    try {
+      const fs = require('fs')
+      const svcCfg = JSON.parse(fs.readFileSync(require('os').homedir() + '/.config/opencode/service.json', 'utf8'))
+      const pwd = svcCfg.password
+      if (pwd) svc.auth = 'Basic ' + Buffer.from('opencode:' + pwd).toString('base64')
+    } catch(e) {}
+  }
+  const url = new URL(svc.url)
+  const httpMod = url.protocol === 'https:' ? require('https') : require('http')
+  // v2 API: limit 最大 200，超出返回 400。分页拉齐
+  const PAGE = 200
+  const MAXPAGE = 5
+  const fetchPage = (offset) => {
+    const path = '/api/session/' + encodeURIComponent(sessionId) + '/message?limit=' + PAGE + '&offset=' + offset
+    return new Promise((resolve) => {
+      const opts = {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path,
+        method: 'GET',
+        headers: { 'Authorization': svc.auth }
+      }
+      const req = httpMod.request(opts, (res) => {
+        let buf = ''
+        res.on('data', (c) => { buf += c })
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(buf)
+            resolve(Array.isArray(parsed.data) ? parsed.data : [])
+          } catch(e) { resolve([]) }
+        })
       })
+      req.on('error', () => resolve([]))
+      req.setTimeout(10000, () => { req.destroy(); resolve([]) })
+      req.end()
     })
-    req.on('error', () => resolve([]))
-    req.setTimeout(10000, () => { req.destroy(); resolve([]) })
-  })
+  }
+  const all = []
+  const seen = {}
+  for (let p = 0; p < MAXPAGE; p++) {
+    const list = await fetchPage(all.length)
+    if (!list.length) break
+    let added = 0
+    for (const m of list) {
+      if (m && m.id && seen[m.id]) continue
+      if (m && m.id) seen[m.id] = 1
+      all.push(m)
+      added++
+    }
+    if (!added || list.length < PAGE) break
+  }
+  return all
 }
 
 const msgTime = (m) => {
-  const info = m && m.info || {}
-  const t = info.time || {}
-  return Number(t.created) || Number(m && (m.created_at || m.time)) || 0
+  const t = m && m.time
+  if (t && t.created) return Number(t.created)
+  return Number(m && (m.created_at || m.time)) || 0
 }
 
 const convSessionMessages = (msgs) => {
@@ -2113,68 +2154,90 @@ const convSessionMessages = (msgs) => {
     curErrored = false
   }
   for (let i = 0; i < msgs.length; i++) {
-    const info = msgs[i].info || {}
-    const role = info.role || 'assistant'
-    const srcParts = msgs[i].parts || []
-    if (role === 'user') {
+    const m = msgs[i]
+    const type = m.type
+    if (type === 'idle') continue
+    if (type === 'user') {
       finalize()
-      let text = ''
-      for (let j = 0; j < srcParts.length; j++) {
-        if (srcParts[j].type === 'text') text += (srcParts[j].text || '')
-      }
+      const text = m.text || ''
       if (text.trim()) out.push({ role: 'user', content: text })
       continue
     }
-    const parts = []
-    for (let j = 0; j < srcParts.length; j++) {
-      const p = srcParts[j]
-      if (p.type === 'text' && p.text) {
-        parts.push({ t: 'text', c: p.text })
-      } else if (p.type === 'file') {
-        parts.push({ t: 'ref', c: '▸ file ' + ((p.file && p.file.path) || ''), cls: 'info' })
-      } else if (p.type === 'tool') {
-        const st = p.state || {}
-        const inp = st.input || {}
-        const arg = toolArg(inp)
-        const out2 = st.output || (st.metadata && st.metadata.output) || ''
-        const toolName = p.tool || 'tool'
-        const status = st.status || ''
-        if (status === 'error') {
-          parts.push({ t: 'ref', c: '✗ ' + toolName + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
-        } else if (status === 'completed') {
-          parts.push({ t: 'ref', c: '◈ ' + toolName + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
-        }
-        if (out2) parts.push({ t: 'out', c: maskSecrets(out2) })
+    if (type === 'system') {
+      finalize()
+      const text = m.text || m.description || ''
+      if (text.trim()) out.push({ role: 'system', content: text, meta: '📋 system' })
+      continue
+    }
+    if (type === 'model-switched') {
+      finalize()
+      const model = m.model || {}
+      out.push({ role: 'assistant', content: '', parts: [{ t: 'ref', c: '🔄 Model switched to ' + (model.id || 'unknown'), cls: 'info' }] })
+      continue
+    }
+    if (type === 'assistant') {
+      const content = m.content || []
+      const tokens = m.tokens || {}
+      const model = m.model || {}
+      if (!content.length) continue
+      if (!cur) {
+        cur = { role: 'assistant', parts: [] }
+        out.push(cur)
       }
+      for (let j = 0; j < content.length; j++) {
+        const p = content[j]
+        if (p.type === 'text' && p.text) {
+          cur.parts.push({ t: 'text', c: p.text })
+        } else if (p.type === 'reasoning' && p.text) {
+          cur.parts.push({ t: 'ref', c: '✱ reasoning', cls: 'reasoning' })
+          cur.parts.push({ t: 'text', c: p.text, cls: 'reasoning' })
+          cur.parts.push({ t: 'ref', c: '✓ reasoning done', cls: 'reasoning' })
+        } else if (p.type === 'tool') {
+          const state = p.state || {}
+          const inp = state.input || {}
+          let arg = ''
+          if (typeof inp === 'object' && inp !== null) {
+            arg = inp.command || inp.input || inp.args || inp.cmd || inp.script || ''
+            if (typeof arg === 'object' && arg !== null) arg = JSON.stringify(arg)
+          } else if (typeof inp === 'string') {
+            arg = inp
+          }
+          if (typeof arg !== 'string') arg = String(arg)
+          let out2 = ''
+          if (Array.isArray(state.content)) {
+            out2 = state.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+          } else {
+            out2 = state.output || state.result || state.stdout || state.content || ''
+          }
+          if (typeof out2 === 'object' && out2 !== null) out2 = JSON.stringify(out2)
+          const status = state.status || ''
+          if (status === 'error') {
+            cur.parts.push({ t: 'ref', c: '✗ ' + (p.name || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
+          } else {
+            cur.parts.push({ t: 'ref', c: '✓ ' + (p.name || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), cls: 'tool' })
+          }
+          if (out2) cur.parts.push({ t: 'out', c: maskSecrets(out2) })
+        }
+      }
+      if (tokens && tokens.total) curTokens = tokens.total
+      if (model && model.id) curModel = (model.providerID || 'opencode') + '/' + model.id
+      if (m.outcome === 'failed') curErrored = true
     }
-    if (info.error) {
-      parts.push({ t: 'text', c: 'Error: ' + ((info.error.message || info.error.name) || 'opencode error'), cls: 'err-text' })
-    }
-    if (!parts.length) continue
-    if (!cur) {
-      cur = { role: 'assistant', parts: [] }
-      out.push(cur)
-    }
-    for (let k = 0; k < parts.length; k++) cur.parts.push(parts[k])
-    if (info.error) curErrored = true
-    if (info.tokens && info.tokens.total) curTokens = info.tokens.total
-    if (info.modelID) curModel = (info.providerID || 'opencode') + '/' + info.modelID
   }
   finalize()
   return out
 }
 
-$fend('session_messages', (data) => {
+$fend('session_messages', async (data) => {
   const id = data && data.id
-  return ensureServer().then((ready) => {
-    if (!ready) return { messages: [] }
-    return fetchSessionMessages(id).then((msgs) => {
-      msgs.sort((a, b) => msgTime(a) - msgTime(b))
-      return { messages: convSessionMessages(msgs) }
-    })
-  }).catch(() => {
+  if (!id) return { messages: [] }
+  try {
+    const msgs = await fetchSessionMessages(id)
+    msgs.sort((a, b) => msgTime(a) - msgTime(b))
+    return { messages: convSessionMessages(msgs) }
+  } catch(e) {
     return { messages: [] }
-  })
+  }
 })
 
 const runWatchdogs = {}
@@ -2447,14 +2510,22 @@ $fend('start', async (data) => {
   const prompt = data.prompt
   const httpMod = require('http')
 
+  // v2: 动态服务地址 + Basic Auth
+  const svcInfo = await getServiceInfo()
+  const svcUrl = svcInfo.url ? new URL(svcInfo.url) : null
+  const svcBase = svcUrl ? { hostname: svcUrl.hostname, port: svcUrl.port || (svcUrl.protocol === 'https:' ? 443 : 80), protocol: svcUrl.protocol } : { hostname: '127.0.0.1', port: 80, protocol: 'http:' }
+
   const api = (method, path, body) => {
     return new Promise((resolve, reject) => {
       const payload = body ? JSON.stringify(body) : ''
+      const url = svcUrl || new URL('http://127.0.0.1')
       const opts = {
-        host: '127.0.0.1', port: 14096, path: path, method: method,
-        headers: body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: '/api' + path, method: method,
+        headers: Object.assign({ 'Authorization': svcInfo.auth }, body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
       }
-      const req = httpMod.request(opts, (res) => {
+      const req = (url.protocol === 'https:' ? require('https') : httpMod).request(opts, (res) => {
         let buf = ''
         res.on('data', (c) => { buf += c })
         res.on('end', () => { resolve({ status: res.statusCode, body: buf }) })
@@ -2533,9 +2604,11 @@ $fend('start', async (data) => {
         pushCtx(used, 0)
       }
 
-      const es = httpMod.get({
-        host: '127.0.0.1', port: 14096, path: '/event',
-        headers: { 'Accept': 'text/event-stream' }
+      const es = (svcUrl && svcUrl.protocol === 'https:' ? require('https') : httpMod).get({
+        hostname: svcBase.hostname,
+        port: svcBase.port,
+        path: '/api/event',
+        headers: { 'Accept': 'text/event-stream', 'Authorization': svcInfo.auth }
       }, (res) => {
         let buf = ''
         res.setEncoding('utf8')
@@ -2605,114 +2678,38 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         fail('SSE error: ' + e.message)
       })
 
+      // v2 事件流: session.text.delta / session.reasoning.* / session.tool.* / session.step.* / session.usage.updated / session.execution.*
       const handleEvent = (ev) => {
-        const p = ev.properties || {}
+        const p = ev.data || ev.properties || {}
+        const sid2 = p.sessionID || ev.sessionID
+        if (sid2 && sessionId && sid2 !== sessionId) return
         if (ev.type === 'question.asked') {
-          const qsid = p.sessionID
-          if (qsid && sessionId && qsid !== sessionId) return
-          sseChat(runId, { type: 'question', data: { requestID: p.id, sessionID: p.sessionID, questions: p.questions || [], tool: p.tool || null } })
+          sseChat(runId, { type: 'question', data: { requestID: p.id || p.requestID, sessionID: p.sessionID, questions: p.questions || [], tool: p.tool || null } })
           return
         }
         if (ev.type === 'question.replied' || ev.type === 'question.rejected') {
-          if (p.sessionID && sessionId && p.sessionID !== sessionId) return
-          sseChat(runId, { type: 'question_done', data: { requestID: p.requestID } })
+          sseChat(runId, { type: 'question_done', data: { requestID: p.requestID || p.id } })
           return
         }
-        if (ev.type === 'permission.v2.asked' || ev.type === 'permission.asked') {
-          const pd = ev.data || ev.properties || {}
-          const permId = pd.id || pd.requestID
-          if (pd.sessionID && sessionId && pd.sessionID !== sessionId) return
+        if (ev.type === 'permission.asked' || ev.type === 'permission.v2.asked') {
+          const permId = p.id || p.requestID
           if (permId) {
-            const res = pd.resources || pd.patterns || []
+            const res = p.resources || p.patterns || []
             const resList = Array.isArray(res) ? res.map(String) : [String(res)]
-            sendRef('🔒 permission · ' + (pd.action || pd.permission || 'request') + (resList.length ? ' · ' + resList.join(', ') : ''), 'permission')
-            sseChat(runId, { type: 'permission', data: { requestID: permId, sessionID: pd.sessionID, action: pd.action || pd.permission || '', resources: resList, metadata: pd.metadata || null, source: pd.source || null, legacy: ev.type === 'permission.asked' } })
+            sendRef('🔒 permission · ' + (p.action || p.permission || 'request') + (resList.length ? ' · ' + resList.join(', ') : ''), 'permission')
+            sseChat(runId, { type: 'permission', data: { requestID: permId, sessionID: p.sessionID, action: p.action || p.permission || '', resources: resList, metadata: p.metadata || null, source: p.source || null, legacy: false } })
           }
           return
         }
-        if (ev.type === 'permission.v2.replied' || ev.type === 'permission.replied') {
-          const pd = ev.data || ev.properties || {}
-          if (pd.sessionID && sessionId && pd.sessionID !== sessionId) return
-          sseChat(runId, { type: 'permission_done', data: { requestID: pd.requestID || pd.id, reply: pd.reply || '' } })
+        if (ev.type === 'permission.replied' || ev.type === 'permission.v2.replied') {
+          sseChat(runId, { type: 'permission_done', data: { requestID: p.requestID || p.id, reply: p.reply || '' } })
           return
         }
-        if (ev.type === 'message.part.delta') {
-          if (p.field === 'text' && p.delta) {
-            sseChat(runId, { type: 'text', content: p.delta })
-          } else if (p.field === 'reasoning' && p.delta) {
-            reasonStart(p.partID)
-          }
-          return
-        }
-        if (ev.type === 'message.part.updated') {
-          const part = p.part || {}
-          const sid2 = part.sessionID || p.sessionID || ev.sessionID
-          if (sid2 && sid2 !== sessionId) return
-          if (part.type === 'step-start') {
-            stepCount++
-            return
-          }
-          if (part.type === 'step-finish') {
-            if (part.tokens && part.tokens.total) emitCtx(part.tokens.total)
-            return
-          }
-          if (part.type === 'reasoning') {
-            if (part.time && part.time.end) reasonDone(part.id)
-            else reasonStart(part.id)
-            return
-          }
-          if (part.type === 'file') {
-            sendRef('▸ file ' + ((part.file && part.file.path) || ''), 'info')
-            return
-          }
-          if (part.type === 'tool') {
-            const st = part.state || {}
-            const inp = st.input || {}
-            const arg = toolArg(inp)
-            const callId = part.callID || part.id || (part.tool || 'tool') + '#' + (++toolSeq)
-            const out = toolOut(st.output || (st.metadata && st.metadata.output))
-            if (part.tool === 'question') {
-              if (!seenTools[callId] && (st.status === 'pending' || st.status === 'running')) {
-                seenTools[callId] = true
-                sendRef('◈ question asked', 'tool')
-              }
-              return
-            }
-            if (st.status === 'pending' || st.status === 'running') {
-              if (!seenTools[callId] && arg) {
-                seenTools[callId] = true
-                sendRef('◈ ' + (part.tool || 'tool') + ' · ' + maskSecrets(arg), 'tool')
-              } else if (!seenTools[callId] && st.status === 'running') {
-                seenTools[callId] = true
-                sendRef('◈ ' + (part.tool || 'tool'), 'tool')
-              }
-              if (!runningTools[callId]) runningTools[callId] = { tool: part.tool || 'tool', arg: arg, started: Date.now() }
-              if (out) runningTools[callId].lastOutput = out
-              runningTools[callId].lastUpdate = Date.now()
-              if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
-            } else if (st.status === 'completed') {
-              delete runningTools[callId]
-              if (!seenTools[callId]) {
-                seenTools[callId] = true
-                sendRef('◈ ' + (part.tool || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), 'tool')
-              }
-              sendRef('✓ ' + (part.tool || 'tool') + ' done', 'tool')
-              if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
-            } else if (st.status === 'error') {
-              delete runningTools[callId]
-              sendRef('✗ ' + (part.tool || 'tool') + ' failed', 'tool')
-              if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
-            }
-            return
-          }
-        }
-        if (ev.type === 'message.updated') {
-          const info = p.info || {}
-          if (info.role === 'assistant' && info.error) {
-            fail((info.error.name ? info.error.name + ': ' : '') + (info.error.message || 'opencode error'))
-          }
-          if (info.model && info.model.modelID) {
-            model = info.model.providerID + '/' + info.model.modelID
+        if (ev.type === 'session.step.started') {
+          stepCount++
+          const mdl = p.model || {}
+          if (mdl.id) {
+            model = (mdl.providerID || 'opencode') + '/' + mdl.id
             if (!modelShown) {
               modelShown = true
               sendRef('> build · ' + model, 'info')
@@ -2726,47 +2723,106 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
           }
           return
         }
-        if (ev.type === 'session.status') {
-          let status = p.status
-          if (typeof status === 'object' && status) status = status.type
-          if (status === 'idle') {
-            finish({ content: '', model: model, tokens: tokens })
-          } else if (status === 'retry') {
-            sendRef('↻ retrying…', 'info')
+        if (ev.type === 'session.reasoning.started') {
+          reasonStart(p.ordinal != null ? String(p.ordinal) : (p.assistantMessageID || '_'))
+          return
+        }
+        if (ev.type === 'session.reasoning.delta') {
+          reasonStart(p.ordinal != null ? String(p.ordinal) : '_')
+          if (p.delta) sseChat(runId, { type: 'text', content: p.delta, cls: 'reasoning' })
+          return
+        }
+        if (ev.type === 'session.reasoning.ended') {
+          reasonDone(p.ordinal != null ? String(p.ordinal) : '_')
+          return
+        }
+        if (ev.type === 'session.text.delta') {
+          if (p.delta) sseChat(runId, { type: 'text', content: p.delta })
+          return
+        }
+        if (ev.type === 'session.tool.input.started') {
+          const callId = p.id || ('tool#' + (++toolSeq))
+          runningTools[callId] = { tool: p.name || 'tool', arg: '', started: Date.now(), lastUpdate: Date.now() }
+          return
+        }
+        if (ev.type === 'session.tool.input.ended') {
+          const callId = p.id || ('tool#' + toolSeq)
+          let inp = {}
+          try { inp = JSON.parse(p.text || '{}') } catch(e) {}
+          const rt = runningTools[callId]
+          const arg = toolArg(inp)
+          if (rt) { rt.arg = arg; rt.lastUpdate = Date.now() }
+          if (!seenTools[callId]) {
+            seenTools[callId] = true
+            sendRef('◈ ' + ((rt && rt.tool) || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), 'tool')
           }
           return
         }
-        if (ev.type === 'session.idle') {
+        if (ev.type === 'session.tool.called' || ev.type === 'session.tool.progress') {
+          const callId = p.id || ('tool#' + toolSeq)
+          const rt = runningTools[callId]
+          if (rt) rt.lastUpdate = Date.now()
+          if (ev.type === 'session.tool.called' && p.input) {
+            const arg = toolArg(p.input)
+            if (rt && !rt.arg) rt.arg = arg
+            if (!seenTools[callId]) {
+              seenTools[callId] = true
+              sendRef('◈ ' + ((rt && rt.tool) || 'tool') + (arg ? ' · ' + maskSecrets(arg) : ''), 'tool')
+            }
+          }
+          return
+        }
+        if (ev.type === 'session.tool.success' || ev.type === 'session.tool.error') {
+          const callId = p.id || ('tool#' + toolSeq)
+          const rt = runningTools[callId]
+          const toolName = (rt && rt.tool) || 'tool'
+          delete runningTools[callId]
+          if (ev.type === 'session.tool.success') {
+            if (!seenTools[callId]) {
+              seenTools[callId] = true
+              sendRef('◈ ' + toolName + (rt && rt.arg ? ' · ' + maskSecrets(rt.arg) : ''), 'tool')
+            }
+            sendRef('✓ ' + toolName + ' done', 'tool')
+            const out = toolOut(p.content)
+            if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
+          } else {
+            sendRef('✗ ' + toolName + ' failed', 'tool')
+            const out = toolOut(p.content || p.error)
+            if (out) emitOut(lastToolOut, callId, out, (d) => { sseChat(runId, { type: 'out', content: d }) })
+          }
+          return
+        }
+        if (ev.type === 'session.usage.updated') {
+          if (p.tokens) {
+            tokens = p.tokens
+            const used = (p.tokens.input || 0) + (p.tokens.output || 0) + (p.tokens.reasoning || 0) + ((p.tokens.cache && p.tokens.cache.read) || 0)
+            if (used) emitCtx(used)
+          }
+          return
+        }
+        if (ev.type === 'session.step.ended') {
+          if (p.tokens) {
+            tokens = p.tokens
+            const used = (p.tokens.input || 0) + (p.tokens.output || 0) + (p.tokens.reasoning || 0) + ((p.tokens.cache && p.tokens.cache.read) || 0)
+            if (used) emitCtx(used)
+          }
+          return
+        }
+        if (ev.type === 'session.execution.succeeded') {
           finish({ content: '', model: model, tokens: tokens })
           return
         }
-        if (ev.type === 'session.error') {
-          const errObj = p.error || {}
-          const errMsg = errObj.message || (errObj.name ? errObj.name : '') || 'session error'
-          const errCode = errObj.code ? ' (' + errObj.code + ')' : ''
-          let errDetail = errObj.detail || errObj.stack || ''
-          if (errDetail) errDetail = String(errDetail).split('\n')[0]
-          fail((errMsg + errCode + (errDetail ? ': ' + errDetail : '')).trim())
+        if (ev.type === 'session.execution.failed' || ev.type === 'session.error') {
+          const errObj = p.error || p
+          const errMsg = (typeof errObj === 'string' ? errObj : (errObj.message || errObj.name || 'session error'))
+          fail(String(errMsg).split('\n')[0])
           return
         }
-        if (ev.type === 'session.compacted') {
-          sendRef('↻ context compacted', 'info')
+        if (ev.type === 'session.renamed') {
           return
         }
-        if (ev.type === 'todo.updated') {
+        if (ev.type === 'todo.updated' || ev.type === 'session.todo.updated') {
           sseChat(runId, { type: 'todo', data: p.todos || [] })
-          return
-        }
-        if (ev.type === 'session.next.tool.success') {
-          const op = p.outputPaths
-          if (op && op.length) sendRef('↧ wrote ' + op.join(', '), 'tool')
-          return
-        }
-        if (ev.type === 'session.next.step.ended') {
-          if (p.tokens) {
-            tokens = p.tokens
-            if (p.tokens.total) emitCtx(p.tokens.total)
-          }
           return
         }
       }
@@ -2779,26 +2835,21 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         const cmdArgs = cmdSpace >= 0 ? cmdLine.slice(cmdSpace + 1).trim() : ''
         try {
           if (cmdName === 'compact' || cmdName === 'summarize') {
-            let sumBody = { providerID: 'opencode', modelID: 'deepseek-v4-flash-free' }
-            if (data.model) {
-              const mm = data.model.replace(/\r/g, '')
-              const ms = mm.indexOf('/')
-              if (ms > 0) sumBody = { providerID: mm.slice(0, ms), modelID: mm.slice(ms + 1) }
-            }
-            const sum = await api('POST', '/session/' + sessionId + '/summarize', sumBody)
-            if (sum.status !== 200) {
+            // v2: 无独立 summarize HTTP 端点，改用内置 /compact 命令
+            const sum = await api('POST', '/session/' + sessionId + '/command', { command: 'compact', arguments: '' })
+            if (sum.status !== 200 && sum.status !== 204) {
               fail('compact failed: ' + sum.body.slice(0, 120))
             } else {
-              sendRef('✂ context compacted', 'info')
+              sendRef('✂ context compacting…', 'info')
               finish({ content: '', model: model, tokens: tokens })
             }
           } else if (cmdName === 'undo' || cmdName === 'redo') {
             const msgs = await api('GET', '/session/' + sessionId + '/message?limit=2')
             let arr = []
-            try { arr = JSON.parse(msgs.body) } catch(e) {}
+            try { arr = JSON.parse(msgs.body); if (arr && arr.data) arr = arr.data } catch(e) {}
             let target = null
             for (let mi = arr.length - 1; mi >= 0; mi--) {
-              const minf = arr[mi].info || {}
+              const minf = arr[mi].info || arr[mi] || {}
               if (minf.role === 'user') { target = minf.id; break }
             }
             if (!target) {
@@ -2826,13 +2877,14 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         return
       }
 
-      const body = { parts: [{ type: 'text', text: prompt }] }
+      // v2: prompt 为 { text, model? }（parts 结构已废弃），POST 后同步返回用户消息
+      const body = { text: prompt }
       if (data.model) {
         const m = data.model.replace(/\r/g, '')
         const slash = m.indexOf('/')
         if (slash > 0) body.model = { providerID: m.slice(0, slash), modelID: m.slice(slash + 1) }
       }
-      const sent = await api('POST', '/session/' + sessionId + '/prompt_async', body)
+      const sent = await api('POST', '/session/' + sessionId + '/prompt', body)
       if (sent.status === 404) {
         fail('session not found: ' + sessionId)
         return
@@ -2843,10 +2895,10 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
           if (typeof $ws.sseExists !== 'function' || $ws.sseExists('opencode-main')) return
           clearInterval(aliveTimer)
           aliveTimer = null
-          const ab = httpMod.request({
-            host: '127.0.0.1', port: 14096,
-            path: '/session/' + encodeURIComponent(sessionId) + '/abort',
-            method: 'POST'
+          const ab = (svcUrl && svcUrl.protocol === 'https:' ? require('https') : httpMod).request({
+            hostname: svcBase.hostname, port: svcBase.port,
+            path: '/api/session/' + encodeURIComponent(sessionId) + '/interrupt',
+            method: 'POST', headers: { 'Authorization': svcInfo.auth }
           }, (r) => {
             r.resume()
             r.on('end', () => { fail('client disconnected') })
@@ -2868,11 +2920,12 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
       if (!sessionId) {
         const created = await api('POST', '/session', { title: title })
         if (created.status !== 200) throw new Error('create session failed: ' + created.body.slice(0, 120))
-        sessionId = JSON.parse(created.body).id
+        const createdObj = JSON.parse(created.body)
+        sessionId = (createdObj.data || createdObj).id
       } else if (title) {
         api('GET', '/session/' + sessionId).then((got) => {
           let cur = ''
-          try { cur = (JSON.parse(got.body) || {}).title || '' } catch(e) {}
+          try { const jo = JSON.parse(got.body); cur = ((jo.data || jo) || {}).title || '' } catch(e) {}
           if (!cur) api('PATCH', '/session/' + sessionId, { title: title })
         }).catch(() => {})
       }
@@ -2895,9 +2948,8 @@ $fend('commands', async (data) => {
     { name: 'redo', description: 'redo last undone message' }
   ]
   try {
-    const r = await httpGet('/command')
-    let list = []
-    try { list = JSON.parse(r.body) } catch(e) {}
+    let list = await apiGet('/command')
+    if (list && list.data) list = list.data
     if (Array.isArray(list)) {
       for (let i = list.length - 1; i >= 0; i--) {
         out.unshift({ name: list[i].name || '', description: list[i].description || '' })
@@ -2925,19 +2977,9 @@ $fend('stop', async (data) => {
   }
   try {
     if (!sessionId) return { ok: false, error: 'no active session' }
-    const httpMod = require('http')
-    return new Promise((resolve, reject) => {
-      const req = httpMod.request({
-        host: '127.0.0.1', port: 14096,
-        path: '/session/' + encodeURIComponent(sessionId) + '/abort',
-        method: 'POST'
-      }, (res) => {
-        res.resume()
-        res.on('end', () => { resolve({ ok: res.statusCode === 200, code: res.statusCode }) })
-      })
-      req.on('error', (e) => { reject(e) })
-      req.end()
-    })
+    // v2: 停止接口为 POST /api/session/<id>/interrupt
+    await apiPost('/session/' + encodeURIComponent(sessionId) + '/interrupt', {})
+    return { ok: true, mode: 'serve' }
   } catch(e) {
     return { ok: false, error: e.message }
   }
@@ -2947,7 +2989,7 @@ const resolveOcVersion = (tries) => {
   return new Promise((resolve) => {
     const attempt = (n) => {
       execAsync(redirCmd(OC_BIN + ' --version'), 20000).then((v) => {
-        const version = v.stdout.trim()
+        const version = v.stdout.trim().replace(/^opencode\s*/i, '')
         if (version) resolve({ ok: true, version: version })
         else if (n > 1) setTimeout(() => { attempt(n - 1) }, 1000)
         else resolve({ ok: false, error: new Error('empty version output') })
@@ -3095,23 +3137,48 @@ $fend('opencode_sessions', async () => {
   try { cached = JSON.parse($store.get('aichat_oc_sessions_cache') || 'null') } catch(e) {}
   try { cachedTime = Number($store.get('aichat_oc_sessions_time') || 0) } catch(e) {}
 
-  // 用 opencode 服务器的 GET /session 获取会话列表（与聊天同一批会话），
-  // 不要用 CLI `opencode session list` —— 它的 cwd 作用域(script/Shell)和服务器目录不一致，列表对不上。
   if (cached && now - cachedTime < 15000) return { sessions: cached, cached: true }
-  const sessions = await httpGet('/session', 14096, 8000).then((r) => {
-    if (r.status !== 200 || !r.body || !r.body.trim()) return null
+  let svc = { url: '', auth: '' }
+  try { svc = await getServiceInfo() } catch(e) {}
+  if (!svc.url) {
+    svc.url = 'http://127.0.0.1:49374'
     try {
-      const list = JSON.parse(r.body)
-      if (!Array.isArray(list)) return null
-      // 兼容服务器格式：updated/created 在 s.time 里，补齐到顶层供前端 fmtTime 使用
-      list.forEach((s) => {
-        if (s.time) {
-          if (!s.updated && s.time.updated) s.updated = s.time.updated
-          if (!s.created && s.time.created) s.created = s.time.created
-        }
+      const fs = require('fs')
+      const svcCfg = JSON.parse(fs.readFileSync(require('os').homedir() + '/.config/opencode/service.json', 'utf8'))
+      const pwd = svcCfg.password
+      if (pwd) svc.auth = 'Basic ' + Buffer.from('opencode:' + pwd).toString('base64')
+    } catch(e) {}
+  }
+  const url = new URL(svc.url)
+  const httpMod = url.protocol === 'https:' ? require('https') : require('http')
+  const opts = {
+    hostname: url.hostname,
+    port: url.port || (url.protocol === 'https:' ? 443 : 80),
+    path: '/api/session',
+    method: 'GET',
+    headers: { 'Authorization': svc.auth }
+  }
+  const sessions = await new Promise((resolve) => {
+    const req = httpMod.request(opts, (res) => {
+      let buf = ''
+      res.on('data', (c) => { buf += c })
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(buf)
+          const list = Array.isArray(parsed.data) ? parsed.data : []
+          list.forEach((s) => {
+            if (s.time) {
+              if (!s.updated && s.time.updated) s.updated = s.time.updated
+              if (!s.created && s.time.created) s.created = s.time.created
+            }
+          })
+          resolve(list)
+        } catch(e) { resolve(null) }
       })
-      return list
-    } catch(e) { return null }
+    })
+    req.on('error', () => resolve(null))
+    req.setTimeout(8000, () => { req.destroy(); resolve(null) })
+    req.end()
   })
   if (sessions) {
     $store.set('aichat_oc_sessions_cache', JSON.stringify(sessions))
@@ -3139,13 +3206,18 @@ $fend('opencode_delete_session', async (data) => {
   return { ok: true }
 })
 
-const ocPost = (path, body) => {
+// v2: 动态服务地址 + Basic Auth，路径自动加 /api 前缀
+const ocPost = async (path, body) => {
+  const httpMod = require('http')
+  const svc = await getServiceInfo()
+  const url = svc.url ? new URL(svc.url) : new URL('http://127.0.0.1')
+  const payload = body ? JSON.stringify(body) : ''
   return new Promise((resolve, reject) => {
-    const httpMod = require('http')
-    const payload = body ? JSON.stringify(body) : ''
-    const req = httpMod.request({
-      host: '127.0.0.1', port: 14096, path: path, method: 'POST',
-      headers: body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}
+    const req = (url.protocol === 'https:' ? require('https') : httpMod).request({
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: '/api' + path, method: 'POST',
+      headers: Object.assign({ 'Authorization': svc.auth }, body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
     }, (res) => {
       let buf = ''
       res.on('data', (c) => { buf += c })
@@ -3158,13 +3230,18 @@ const ocPost = (path, body) => {
   })
 }
 
-const httpPut = (path, body) => {
+// v2: 动态服务地址 + Basic Auth（保留供未迁移的 v1 端点调用方使用，路径不加前缀）
+const httpPut = async (path, body) => {
+  const httpMod = require('http')
+  const svc = await getServiceInfo()
+  const url = svc.url ? new URL(svc.url) : new URL('http://127.0.0.1')
+  const payload = body ? JSON.stringify(body) : ''
   return new Promise((resolve) => {
-    const httpMod = require('http')
-    const payload = body ? JSON.stringify(body) : ''
-    const req = httpMod.request({
-      host: '127.0.0.1', port: 14096, path: path, method: 'PUT',
-      headers: body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}
+    const req = (url.protocol === 'https:' ? require('https') : httpMod).request({
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: path, method: 'PUT',
+      headers: Object.assign({ 'Authorization': svc.auth }, body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
     }, (res) => {
       let buf = ''
       res.on('data', (c) => { buf += c })
@@ -3199,21 +3276,22 @@ $fend('login_check', async () => {
   if (!up) {
     return { ok: true, possible: true, serverDown: true, connected: [], providers: LOGIN_FALLBACK_PROVIDERS.slice() }
   }
-  const provider = await httpGetJson('/provider', 14096, 8000).catch(() => null)
-  const connected = (provider && Array.isArray(provider.connected)) ? provider.connected : []
+  // v2: GET /api/provider 返回 { data: [...] }（integration 列表）；无独立的 connected 字段
   const list = []
+  let connected = []
   try {
-    const authMethods = await httpGetJson('/provider/auth', 14096, 8000)
-    if (authMethods) {
-      for (const pid of Object.keys(authMethods)) {
-        const methods = authMethods[pid] || []
-        for (const m of methods) {
-          if (m && m.type === 'api') {
-            list.push({ id: pid, name: pid, hint: (m.label && m.label !== 'Manually enter API Key' && m.label !== 'API key') ? m.label : '' })
-            break
-          }
-        }
-      }
+    const provs = await apiGet('/provider')
+    const parr = (provs && provs.data) ? provs.data : (Array.isArray(provs) ? provs : [])
+    for (const p of parr) {
+      if (p && p.id) list.push({ id: p.id, name: p.name || p.id, hint: '' })
+    }
+  } catch(e) {}
+  try {
+    const integ = await apiGet('/integration')
+    const iarr = (integ && integ.data) ? integ.data : (Array.isArray(integ) ? integ : [])
+    for (const ig of iarr) {
+      const conns = ig && ig.connections
+      if (Array.isArray(conns) && conns.length && ig.id && !connected.includes(ig.id)) connected.push(ig.id)
     }
   } catch(e) {}
   for (const f of LOGIN_FALLBACK_PROVIDERS) {
@@ -3227,18 +3305,15 @@ $fend('login_apikey', async (data) => {
   const key = data && data.key ? String(data.key).trim() : ''
   if (!provider) return { ok: false, error: 'provider is empty' }
   if (!key) return { ok: false, error: 'API key is empty' }
-  if (!(await ensureServer())) return { ok: false, error: 'opencode server is not running' }
-  const r = await httpPut('/auth/' + encodeURIComponent(provider), { type: 'api', key: key })
-  if (r.status === 200) {
-    const accepted = r.body && r.body.trim() === 'true'
-    if (accepted) {
-      console.log('[login_apikey] provider', provider, 'saved')
-      return { ok: true, provider: provider }
-    }
-    return { ok: false, error: 'login rejected: ' + r.body.slice(0, 200) }
+  // v2: 无 PUT /api/auth HTTP 端点，改走 CLI `opencode auth login <provider> --method key --answer key=<key>`
+  try {
+    await execAsync(OC_BIN + ' auth login ' + provider + ' --method key --answer key=' + key.replace(/["'\\]/g, ''), 30000)
+    console.log('[login_apikey] provider', provider, 'saved')
+    return { ok: true, provider: provider }
+  } catch(e) {
+    const errText = stripAnsi((e && (e.stderr || e.message)) || String(e)).split('\n')[0].slice(0, 200)
+    return { ok: false, error: 'login failed: ' + errText }
   }
-  if (r.error) return { ok: false, error: r.error }
-  return { ok: false, error: 'auth failed (http ' + r.status + '): ' + r.body.slice(0, 200) }
 })
 
 $fend('question_reply', async (data) => {
@@ -3268,9 +3343,8 @@ $fend('permission_reply', async (data) => {
   const reply = ['once', 'always', 'reject'].indexOf(data.reply) >= 0 ? data.reply : ''
   if (!reply) return { ok: false, error: 'invalid reply' }
   try {
-    const path = data.legacy
-      ? '/permission/' + encodeURIComponent(data.requestID) + '/reply'
-      : '/api/session/' + encodeURIComponent(data.sessionID || '') + '/permission/' + encodeURIComponent(data.requestID) + '/reply'
+    // ocPost 会自动加 /api 前缀
+    const path = '/session/' + encodeURIComponent(data.sessionID || '') + '/permission/' + encodeURIComponent(data.requestID) + '/reply'
     const r = await ocPost(path, { reply: reply, message: data.message || '' })
     if (r.status !== 200) return { ok: false, error: r.body.slice(0, 200) }
     return { ok: true }
