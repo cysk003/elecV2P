@@ -3161,6 +3161,12 @@ $fend('stop', async (data) => {
   }
 })
 
+const isOcV2 = (version) => {
+  const major = parseInt(String(version || '').replace(/^v/i, ''), 10)
+  // 解析不出来时不强制重装，避免 dev/特殊版本号反复触发安装
+  return isNaN(major) || major >= 2
+}
+
 const resolveOcVersion = (tries) => {
   return new Promise((resolve) => {
     const attempt = (n) => {
@@ -3181,11 +3187,12 @@ const resolveOcVersion = (tries) => {
 // 安装进度统一走 opencode-main 通道（消息带 install: true 标记），不再另开随机 SSE 通道
 $fend('ensure_opencode', async (data) => {
   const r = await resolveOcVersion(2)
-  if (r.ok) {
+  if (r.ok && isOcV2(r.version)) {
     const version = r.version
     console.log('[ensure_opencode] version:', version)
     return { ok: true, installing: false, version: version }
   }
+  if (r.ok) console.log('[ensure_opencode] v1 detected, upgrading to v2:', r.version)
   const ssePush = (obj) => { try { $ws.sse('opencode-main', JSON.stringify(Object.assign({ install: true }, obj))) } catch(e) {} }
   try {
     const freeMem = require('os').freemem()
@@ -3196,7 +3203,12 @@ $fend('ensure_opencode', async (data) => {
       ssePush({ type: 'error', content: msg })
       return { ok: false, error: msg }
     }
-    const INSTALL_CMD = 'npm install -g opencode-ai@latest --loglevel=verbose'
+    // v1 的 npm 包是 opencode-ai，v2 是 @opencode/cli；两者共用 opencode 命令，必须先卸载 v1
+    const uninstallCmd = 'npm uninstall -g opencode-ai'
+    const installCmd = 'npm install -g @opencode/cli@latest --loglevel=verbose'
+    const INSTALL_CMD = process.platform === 'win32'
+      ? uninstallCmd + ' & ' + installCmd
+      : uninstallCmd + ' >/dev/null 2>&1; ' + installCmd
     ssePush({ type: 'cmd', content: INSTALL_CMD })
     const proc = spawn(process.platform === 'win32' ? process.env.COMSPEC : 'sh',
       process.platform === 'win32' ? ['/d', '/s', '/c', INSTALL_CMD + ' 2>&1'] : ['-c', INSTALL_CMD + ' 2>&1'],
@@ -3224,6 +3236,10 @@ $fend('ensure_opencode', async (data) => {
           console.log('[npm install] done, version:', version)
           if (!vr.ok) console.log('[npm install] version check failed:', vr.error && vr.error.message)
           ssePush({ type: 'full_log', content: fullLog.join('\n') })
+          if (!vr.ok || !isOcV2(version)) {
+            ssePush({ type: 'error', content: 'Installed opencode is not v2 (version: ' + version + ')' })
+            return
+          }
           ssePush({ type: 'done', version: version })
         } else {
           ssePush({ type: 'full_log', content: fullLog.join('\n') })
