@@ -12,14 +12,3 @@ qemu-*-static
 Docker/hooks/
 Docker/docker-compose*.yaml
 Docker/readme.md
-web/src/
-web/public/
-vite.config.js
-
-# 文档
-*.md
-
-# 运行时数据
-logs/
-rootCA/
-efss/

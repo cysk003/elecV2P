@@ -7,6 +7,14 @@ const EasyCert = require('node-easy-cert')
 const anycrtpath = path.join(os.homedir(), '.anyproxy/certificates')
 const rootCApath = path.join(__dirname, '../rootCA')
 
+// 镜像构建时 rootCA/ 可能被 .dockerignore 排除，读取前先确保目录存在
+if(!fs.existsSync(anycrtpath)) {
+  fs.mkdirSync(anycrtpath, { recursive: true })
+}
+if(!fs.existsSync(rootCApath)) {
+  fs.mkdirSync(rootCApath, { recursive: true })
+}
+
 const crt_path = {
   any: anycrtpath,
   crt: path.join(rootCApath, 'rootCA.crt'),
@@ -18,13 +26,6 @@ const crt_path = {
     }
     return ''
   })(),
-}
-
-if(!fs.existsSync(anycrtpath)) {
-  fs.mkdirSync(anycrtpath, { recursive: true })
-}
-if(!fs.existsSync(rootCApath)) {
-  fs.mkdirSync(rootCApath, { recursive: true })
 }
 
 const { logger, errStack, now, euid } = require('../utils')
