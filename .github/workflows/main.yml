@@ -8,42 +8,105 @@ on:
 
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: ${{ secrets.DOCKER_HUB_USERNAME }}/elecv2p
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
-
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-          
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
-        
-      - name: Build and push
-        id: docker_build
-        uses: docker/build-push-action@v3
+        uses: docker/setup-buildx-action@v3
+
+      # Keep the two architectures apart so they don't overwrite each other's
+      # tags. The publish job merges them into the final multi-arch manifest.
+      - name: Add architecture suffix to tags
+        id: archtags
+        shell: bash
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          tags=$(printf '%s' "$TAGS" | tr ',' '\n' | sed "/^$/d;s/$/-${ARCH}/" | paste -sd, -)
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.platform }}
+        uses: docker/build-push-action@v6
         with:
           context: ./
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           file: ./Docker/Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.archtags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+
+  publish:
+    name: Publish multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_HUB_USERNAME }}/elecv2p
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create multi-arch manifest
+        shell: bash
+        env:
+          IMAGE: ${{ secrets.DOCKER_HUB_USERNAME }}/elecv2p
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            if [ -z "$tag" ]; then
+              continue
+            fi
+            version=${tag##*:}
+            docker buildx imagetools create -t "$tag" \
+              "${IMAGE}:${version}-amd64" "${IMAGE}:${version}-arm64"
+          done <<< "$(printf '%s' "$TAGS" | tr ',' '\n')"
 
       - name: Sync Readme
         uses: ms-jpq/sync-dockerhub-readme@v1
@@ -53,5 +116,11 @@ jobs:
           repository: elecv2/elecv2p
           readme: "./Readme.md"
 
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+      - name: Inspect manifest
+        shell: bash
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tag=$(printf '%s' "$TAGS" | tr ',' '\n' | head -n 1)
+          docker buildx imagetools inspect "$tag"
