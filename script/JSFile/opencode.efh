@@ -342,8 +342,9 @@
     .msg .meta.err { color: var(--del); }
     .question-panel {
       flex-shrink: 0; background: var(--bk2); border-top: 1px solid var(--bd);
-      padding: 10px 16px; max-height: 45%; overflow-y: auto;
+      border-left: 3px solid #fa0; padding: 10px 16px; max-height: 45%; overflow-y: auto;
     }
+    .question-panel .q-panel-head { font-size: 11px; color: var(--ac); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
     .question-panel .q-item { margin-bottom: 12px; }
     .question-panel .q-header { font-size: 11px; color: var(--ac); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
     .question-panel .q-text { font-size: 14px; color: var(--fc); margin: 2px 0 8px; }
@@ -561,6 +562,7 @@
   </div>
 
   <div class="question-panel" v-if="question">
+    <div class="q-panel-head">❓ Question</div>
     <div v-for="(q, qi) in question.questions" :key="qi" class="q-item">
       <div class="q-header">{{ q.header || 'Question' }}</div>
       <div class="q-text">{{ q.question }}</div>
@@ -613,6 +615,16 @@
   const blockCache = new Map()
   const BLOCK_CACHE_MAX = 400
   const STREAM_PARSE_MAX = 4000
+
+  // 单条消息自身的 token 用量：完整上下文快照减去复用缓存 cache.read。
+  // 与 OpenCode TUI 的 per-step "new" 口径一致；不是 session 累计，也不是右上角 ctx 总量。
+  const msgTokenUsed = (tk) => {
+    if (!tk) return 0
+    if (tk.total != null) return Number(tk.total) || 0
+    const total = (Number(tk.input) || 0) + (Number(tk.output) || 0) + (Number(tk.reasoning) || 0) + ((tk.cache && Number(tk.cache.read)) || 0) + ((tk.cache && Number(tk.cache.write)) || 0)
+    const cached = (tk.cache && Number(tk.cache.read)) || 0
+    return Math.max(0, total - cached)
+  }
 
   // ANSI 转 HTML，逻辑同 utils/ansi.js（供工具输出带色渲染）
   const ANSI_MAX = 500000
@@ -1282,10 +1294,9 @@
               if (!el.stopped) {
                 let meta = Math.round((Date.now() - startTime) / 1000) + 's'
                 if (data.tokens) {
-                  // v2 tokens 无 total 字段：{ input, output, reasoning, cache: { read } }
-                  const tk = data.tokens
-                  const total = tk.total != null ? Number(tk.total) : (Number(tk.input) || 0) + (Number(tk.output) || 0) + (Number(tk.reasoning) || 0) + ((tk.cache && Number(tk.cache.read)) || 0)
-                  if (total) meta += ' | ⚙ ' + total.toLocaleString() + ' tokens'
+                  // 只显示这条消息自身新增的 token，不显示包含复用缓存的上下文总量
+                  const used = msgTokenUsed(data.tokens)
+                  if (used) meta += ' | ⚙ ' + used.toLocaleString() + ' tokens'
                 }
                 if (data.steps) meta += ' | ' + data.steps + ' steps'
                 if (data.model) meta += ' | ' + data.model
@@ -1418,15 +1429,25 @@
       qSubmit() {
         const self = this
         if (!this.question || this.qSubmitting) return
-        const answers = this.question.questions.map((q, qi) => {
+        const answers = []
+        const formAnswers = {}
+        this.question.questions.forEach((q, qi) => {
           const arr = (this.qSel[qi] || []).slice()
           const custom = (this.qCustom[qi] || '').trim()
           if (custom && q.custom !== false && arr.indexOf(custom) < 0) arr.push(custom)
-          return arr
+          answers.push(arr)
+          const key = q.key || ('q' + qi)
+          if (arr.length) formAnswers[key] = q.multiple ? arr : arr[0]
         })
         this.qSubmitting = true
         const qData = this.question
-        this.fetchFend('question_reply', { requestID: this.question.requestID, sessionID: this.question.sessionID, answers: answers }, 15000).then((data) => {
+        this.fetchFend('question_reply', {
+          requestID: this.question.requestID,
+          sessionID: this.question.sessionID,
+          answers: answers,
+          formAnswers: formAnswers,
+          form: !!this.question.form
+        }, 15000).then((data) => {
           self.qSubmitting = false
           if (data && data.ok) {
             if (self.qEl && qData && Array.isArray(qData.questions)) {
@@ -1454,7 +1475,7 @@
         const self = this
         if (!this.question || this.qSubmitting) return
         this.qSubmitting = true
-        this.fetchFend('question_reject', { requestID: this.question.requestID }, 15000).then((data) => {
+        this.fetchFend('question_reject', { requestID: this.question.requestID, sessionID: this.question.sessionID, form: !!this.question.form }, 15000).then((data) => {
           self.qSubmitting = false
           if (data && data.ok) {
             if (self.qEl) self.qEl.parts.push({ t: 'ref', c: '✖ question dismissed', cls: 'answer' })
@@ -2046,35 +2067,52 @@ $fend('ctxinfo', (data) => {
   })
 })
 
-// 从消息列表计算当前上下文占用：从最新往前找；assistant 用其 tokens 总量，
-// compaction（压缩完成）用其 tokens.input 作为压缩后的新上下文基线
+// v2 tokens 结构为 { input, output, reasoning, cache: { read, write } }，无 total 字段
+// 与 opencode TUI 的 contextUsage 保持一致：全部相加才是模型报告的完整用量
+const tokenTotal = (t) => {
+  if (!t) return 0
+  if (t.total != null) return Number(t.total) || 0
+  return (Number(t.input) || 0) + (Number(t.output) || 0) + (Number(t.reasoning) || 0) + ((t.cache && Number(t.cache.read)) || 0) + ((t.cache && Number(t.cache.write)) || 0)
+}
+
+// 消息自身新增的 token：从上下文快照里去掉复用缓存 cache.read。
+// 用于消息结尾 footer；右上角 ctx 仍用 tokenTotal（完整上下文占用）。
+const msgTokenUsed = (t) => {
+  if (!t) return 0
+  if (t.total != null) return Number(t.total) || 0
+  return Math.max(0, tokenTotal(t) - ((t.cache && Number(t.cache.read)) || 0))
+}
+
+// opencode 把压缩用量拆成 input+cache（读进来的旧上下文）和 output+reasoning（生成的摘要）。
+// 这里按“压缩前 → 压缩后”显示，数字全部来自工具报告，不自己推算。
+const compactBefore = (t) => (Number(t && t.input) || 0) + ((t && t.cache && Number(t.cache.read)) || 0) + ((t && t.cache && Number(t.cache.write)) || 0)
+const compactAfter = (t) => (Number(t && t.output) || 0) + (Number(t && t.reasoning) || 0)
+const compactRef = (t) => {
+  const before = compactBefore(t)
+  const after = compactAfter(t)
+  return '✂ context compacted' + (before && after ? ' · ' + before.toLocaleString() + ' → ' + after.toLocaleString() + ' tokens' : '')
+}
+
+// 直接使用 opencode 自己报告的用量：从最新消息往前找。
+// assistant 用其 tokens 总量（opencode TUI 的 contextUsage 也是这么算的）；
+// 若最后一次动作是压缩，则用压缩报告的摘要 token 数作为压缩后的上下文估值。
+// 不跨消息累加，也不把 compaction 的 input 当基线，compact 前后不会混算。
 const usageFromMsgs = (msgs) => {
-  const tokenCtx = (t) => {
-    if (!t) return 0
-    return Number(t.input) || 0
-  }
   if (!msgs || !msgs.length) return 0
-  // 按时间排序
-  const sorted = msgs.slice().sort((a, b) => {
-    const ta = msgTime(a), tb = msgTime(b)
-    if (ta !== tb) return ta - tb
-    return 0
-  })
-  let total = 0
-  for (let i = 0; i < sorted.length; i++) {
+  const sorted = msgs.slice().sort((a, b) => msgTime(a) - msgTime(b))
+  for (let i = sorted.length - 1; i >= 0; i--) {
     const m = sorted[i]
     if (!m) continue
-    const type = m.type
-    if (type === 'compaction' && m.tokens && m.tokens.input != null) {
-      // 压缩后基线重置
-      total = Number(m.tokens.input) || 0
-      continue
+    if (m.type === 'assistant' && m.tokens) {
+      const used = tokenTotal(m.tokens)
+      if (used) return used
     }
-    if (type === 'assistant' && m.tokens) {
-      total += tokenCtx(m.tokens)
+    if (m.type === 'compaction' && m.tokens && (m.status === 'completed' || m.summary)) {
+      const used = compactAfter(m.tokens)
+      if (used) return used
     }
   }
-  return total
+  return 0
 }
 
 const getSessionUsage = async (sessionId) => {
@@ -2164,20 +2202,12 @@ const msgTime = (m) => {
   return Number(m && (m.created_at || m.time)) || 0
 }
 
-// v2 tokens 结构为 { input, output, reasoning, cache: { read, write } }，无 total 字段
-const tokenTotal = (t) => {
-  if (!t) return 0
-  if (t.total != null) return Number(t.total) || 0
-  return (Number(t.input) || 0) + (Number(t.output) || 0) + (Number(t.reasoning) || 0) + ((t.cache && Number(t.cache.read)) || 0)
-}
-
 const convSessionMessages = (msgs) => {
   const out = []
   let cur = null
   let curTokens = 0
   let curModel = ''
   let curErrored = false
-  let prevCum = 0
   const finalize = () => {
     if (!cur) return
     let meta = curErrored ? '⚠ ' : '✓ '
@@ -2219,10 +2249,9 @@ const convSessionMessages = (msgs) => {
       // 压缩摘要（完成后消息带 summary 字段）
       finalize()
       const summary = m.summary || ''
-      const parts = [{ t: 'ref', c: '✂ context compacted', cls: 'info' }]
+      const parts = [{ t: 'ref', c: compactRef(m.tokens), cls: 'info' }]
       if (summary) parts.push({ t: 'text', c: summary, cls: 'compact' })
       out.push({ role: 'assistant', content: '', parts: parts })
-      prevCum = 0
       continue
     }
     if (type === 'assistant') {
@@ -2271,12 +2300,10 @@ const convSessionMessages = (msgs) => {
           }
         }
       }
-      const tTotal = tokenTotal(tokens)
-      // 历史元信息中不计入 cache.read，避免 token 数虚高
-      const tTotalNoCache = (Number(tokens.input) || 0) + (Number(tokens.output) || 0) + (Number(tokens.reasoning) || 0)
-      const delta = tTotalNoCache > prevCum ? tTotalNoCache - prevCum : tTotalNoCache
-      if (delta) curTokens += delta
-      prevCum = tTotalNoCache
+      // footer 只显示本条 assistant 消息自身新增的 token，不包含复用缓存 cache.read；
+      // 不跨消息累加，也不取 session 累计用量
+      const turnTokens = msgTokenUsed(tokens)
+      if (turnTokens) curTokens = turnTokens
       if (model && model.id) curModel = (model.providerID || 'opencode') + '/' + model.id
       if (m.outcome === 'failed') curErrored = true
     }
@@ -2325,7 +2352,6 @@ const runCliMode = async (data, runId) => {
   let streamEnded = false
   let stepCount = 0
   let tokens = null
-  let beforeUsed = 0  // compact 前的上下文用量（用于压缩前后对比提示）
   let model = modelStr || null
   let knownSession = !!sessionId
   let runSessionId = ''
@@ -2351,8 +2377,6 @@ const runCliMode = async (data, runId) => {
     }
   }
   let watchdog = null
-  let ctxAfterCompact = false  // compact 后基线期标志，防止 usage.updated 覆盖
-  let compactBaseline = 0  // compact 后的基线 token 用量
 
   try { const vr = await resolveOcVersion(2); } catch(e) {}
   this.ocVersion = vr.ok ? vr.version : ''
@@ -2440,9 +2464,22 @@ const runCliMode = async (data, runId) => {
       const callId = part.callID || part.id || (part.tool || 'tool') + '#' + (++toolSeq)
       const out = toolOut(st.output || (st.metadata && st.metadata.output))
       if (part.tool === 'question') {
-        if (!seenTools[callId] && (st.status === 'pending' || st.status === 'running')) {
+        // run --format json 只在工具结束时发 tool_use，所以这里不限定 pending/running
+        if (!seenTools[callId]) {
           seenTools[callId] = true
-          sendRef('◈ question asked', 'tool')
+          // run 模式无法交互回答（OpenCode 会自动取消），至少把问题和选项显示出来
+          const qs = (st.input && st.input.questions) || []
+          let line = '◈ question asked'
+          if (qs.length) {
+            line += '\n' + qs.map((q, qi) => {
+              let s = '❓ ' + (q.header || ('Question ' + (qi + 1))) + ': ' + (q.question || '')
+              if (Array.isArray(q.options) && q.options.length) {
+                s += '\n' + q.options.map((o) => '   · ' + (o.label || o.value || String(o)) + (o.description ? ' — ' + o.description : '')).join('\n')
+              }
+              return s
+            }).join('\n')
+          }
+          sendRef(line, 'question')
         }
         return
       }
@@ -2636,9 +2673,6 @@ $fend('start', async (data) => {
           sendRef('✓ reasoning done', 'reasoning')
         }
       }
-      // compact 后基线期标志，防止 usage.updated 覆盖压缩后的基线
-      let ctxAfterCompact = false
-      let compactBaseline = 0
       let tokens = null
       let watchdog = null
       runWatchdogs[runId] = {
@@ -2752,12 +2786,41 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         const p = ev.data || ev.properties || {}
         const sid2 = p.sessionID || ev.sessionID
         if (sid2 && sessionId && sid2 !== sessionId) return
-        if (ev.type === 'question.asked') {
-          sseChat(runId, { type: 'question', data: { requestID: p.id || p.requestID, sessionID: p.sessionID, questions: p.questions || [], tool: p.tool || null } })
+        if (ev.type === 'form.created' || ev.type === 'question.asked') {
+          // v2.3.2: question 工具不再发 question.asked，而是 form.created + metadata.kind === 'question'
+          const form = p.form || p
+          const meta = form.metadata || {}
+          if (ev.type === 'form.created' && meta.kind !== 'question') return
+          let questions = form.questions || p.questions || []
+          if ((!questions || !questions.length) && Array.isArray(form.fields)) {
+            questions = form.fields.map((f, i) => ({
+              key: f.key || ('q' + i),
+              header: f.title || form.title || 'Question ' + (i + 1),
+              question: f.description || f.title || '',
+              options: Array.isArray(f.options) ? f.options.map((o) => ({
+                label: o.label || o.value || String(o),
+                value: o.value || o.label || String(o),
+                description: o.description || ''
+              })) : [],
+              multiple: f.type === 'multiselect',
+              custom: f.custom !== false
+            }))
+          }
+          questions = (questions || []).map((q, i) => Object.assign({ key: q.key || ('q' + i) }, q))
+          sseChat(runId, {
+            type: 'question',
+            data: {
+              requestID: form.id || p.id || p.requestID,
+              sessionID: form.sessionID || p.sessionID,
+              questions: questions,
+              tool: meta.tool || p.tool || null,
+              form: ev.type === 'form.created'
+            }
+          })
           return
         }
-        if (ev.type === 'question.replied' || ev.type === 'question.rejected') {
-          sseChat(runId, { type: 'question_done', data: { requestID: p.requestID || p.id } })
+        if (ev.type === 'form.replied' || ev.type === 'form.cancelled' || ev.type === 'question.replied' || ev.type === 'question.rejected') {
+          sseChat(runId, { type: 'question_done', data: { requestID: p.id || p.requestID || p.formID } })
           return
         }
         if (ev.type === 'permission.asked' || ev.type === 'permission.v2.asked') {
@@ -2886,26 +2949,16 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
           return
         }
         if (ev.type === 'session.usage.updated') {
-          if (p.tokens) {
-            tokens = p.tokens
-            // 上下文占用只计 input，避免 cache/output/reasoning 导致数值虚高
-            const used = p.tokens.input || 0
-            // compact 后基线期：若 used > compactBaseline，说明是旧的大值，跳过更新以保持压缩后的基线
-            if (used && (!ctxAfterCompact || used <= compactBaseline || compactBaseline === 0)) {
-              emitCtx(used)
-            }
-          }
+          // 这里的 tokens 来自 session 表的累计值（projector 对每个 step 做 +=），
+          // 是整段会话历史的总用量，不是当前上下文大小，不能用于 ctx 或消息结尾的 tokens。
+          // ctx 只取 session.step.ended 的单步 tokens 和 compact 的摘要 tokens。
           return
         }
         if (ev.type === 'session.step.ended') {
           if (p.tokens) {
             tokens = p.tokens
-            // 上下文占用只计 input
-            const used = p.tokens.input || 0
-            // compact 后基线期：同 usage.updated 逻辑
-            if (used && (!ctxAfterCompact || used <= compactBaseline || compactBaseline === 0)) {
-              emitCtx(used)
-            }
+            const used = tokenTotal(p.tokens)
+            if (used) emitCtx(used)
           }
           return
         }
@@ -2934,25 +2987,13 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
         if (ev.type === 'session.compaction.ended') {
           const mdl = p.model || {}
           if (mdl.id) model = (mdl.providerID || 'opencode') + '/' + mdl.id
-          // v2 压缩后不发 usage.updated；ended 瞬间 compaction 消息 tokens 还是执行中间态，
-          // 延迟落库后再拉取压缩后的用量，给出 N → M tokens 对比提示，然后收尾
-          setTimeout(async () => {
-            let after = 0
-            try { after = await getSessionUsage(sessionId) } catch(e) {}
-            if (after) {
-              emitCtx(after)
-              compactBaseline = after
-              ctxAfterCompact = true
-              // 30 秒后自动恢复正常累计，或在下一轮对话开始时自动清除
-              setTimeout(() => { ctxAfterCompact = false; compactBaseline = 0 }, 30000)
-            }
-            if (beforeUsed && after && after < beforeUsed) {
-              sendRef('✂ compacted: ' + beforeUsed.toLocaleString() + ' → ' + after.toLocaleString() + ' tokens', 'info')
-            } else {
-              sendRef('✓ context compacted', 'info')
-            }
-            finish({ content: '', model: model, tokens: tokens })
-          }, 2000)
+          // ended 事件 tokens：input+cache = 压缩前，output+reasoning = 压缩后摘要。
+          // ✂ 行显示 before → after；footer 只记压缩后摘要大小，与其他消息的“单条用量”口径一致。
+          const after = compactAfter(p.tokens)
+          sendRef(compactRef(p.tokens), 'info')
+          if (after) emitCtx(after)
+          tokens = after ? { output: after } : null
+          finish({ content: '', model: model, tokens: tokens })
           return
         }
         if (ev.type === 'todo.updated' || ev.type === 'session.todo.updated') {
@@ -2971,7 +3012,6 @@ if (tool.lastOutput) emitOut(lastToolOut, id, tool.lastOutput, (d) => { sseChat(
           if (cmdName === 'compact' || cmdName === 'summarize') {
             // v2: 专有端点 POST /api/session/<id>/compact，异步执行，
             // 完成后由 SSE 的 session.compaction.started/ended 结束本次流
-            try { beforeUsed = await getSessionUsage(sessionId) } catch(e) {}
             const sum = await api('POST', '/session/' + sessionId + '/compact', {})
             if (sum.status !== 200) {
               fail('compact failed: ' + sum.body.slice(0, 120))
@@ -3342,7 +3382,7 @@ $fend('opencode_delete_session', async (data) => {
 })
 
 // v2: 动态服务地址 + Basic Auth，路径自动加 /api 前缀
-const ocPost = async (path, body) => {
+const ocRequest = async (method, path, body) => {
   const httpMod = require('http')
   const svc = await getServiceInfo()
   const url = svc.url ? new URL(svc.url) : new URL('http://127.0.0.1')
@@ -3351,7 +3391,7 @@ const ocPost = async (path, body) => {
     const req = (url.protocol === 'https:' ? require('https') : httpMod).request({
       hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: '/api' + path, method: 'POST',
+      path: '/api' + path, method: method,
       headers: Object.assign({ 'Authorization': svc.auth }, body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
     }, (res) => {
       let buf = ''
@@ -3364,6 +3404,7 @@ const ocPost = async (path, body) => {
     req.end()
   })
 }
+const ocPost = (path, body) => ocRequest('POST', path, body)
 
 // v2: 动态服务地址 + Basic Auth（保留供未迁移的 v1 端点调用方使用，路径不加前缀）
 const httpPut = async (path, body) => {
@@ -3452,10 +3493,20 @@ $fend('login_apikey', async (data) => {
 })
 
 $fend('question_reply', async (data) => {
-  if (!data || !data.requestID || !Array.isArray(data.answers)) return { ok: false, error: 'invalid params' }
+  if (!data || !data.requestID) return { ok: false, error: 'invalid params' }
   try {
-    const r = await ocPost('/question/' + encodeURIComponent(data.requestID) + '/reply', { answers: data.answers })
-    if (r.status !== 200) return { ok: false, error: r.body.slice(0, 200) }
+    let r
+    if (data.form) {
+      // v2: question 走 form 端点，answer 是按字段 key 索引的对象
+      if (!data.sessionID) return { ok: false, error: 'sessionID is empty' }
+      const answer = (data.formAnswers && typeof data.formAnswers === 'object') ? data.formAnswers : {}
+      const path = '/session/' + encodeURIComponent(data.sessionID) + '/form/' + encodeURIComponent(data.requestID) + '/reply'
+      r = await ocRequest('POST', path, { answer: answer })
+    } else {
+      if (!Array.isArray(data.answers)) return { ok: false, error: 'invalid params' }
+      r = await ocPost('/question/' + encodeURIComponent(data.requestID) + '/reply', { answers: data.answers })
+    }
+    if (r.status < 200 || r.status >= 300) return { ok: false, error: r.body.slice(0, 200) }
     return { ok: true }
   } catch(e) {
     return { ok: false, error: e.message }
@@ -3465,8 +3516,16 @@ $fend('question_reply', async (data) => {
 $fend('question_reject', async (data) => {
   if (!data || !data.requestID) return { ok: false, error: 'invalid params' }
   try {
-    const r = await ocPost('/question/' + encodeURIComponent(data.requestID) + '/reject')
-    if (r.status !== 200) return { ok: false, error: r.body.slice(0, 200) }
+    let r
+    if (data.form) {
+      // v2: 取消 form（success 是 204 No Content）
+      if (!data.sessionID) return { ok: false, error: 'sessionID is empty' }
+      const path = '/session/' + encodeURIComponent(data.sessionID) + '/form/' + encodeURIComponent(data.requestID)
+      r = await ocRequest('DELETE', path)
+    } else {
+      r = await ocPost('/question/' + encodeURIComponent(data.requestID) + '/reject')
+    }
+    if (r.status < 200 || r.status >= 300) return { ok: false, error: r.body.slice(0, 200) }
     return { ok: true }
   } catch(e) {
     return { ok: false, error: e.message }
